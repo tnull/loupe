@@ -7,6 +7,9 @@
 //! - `mcp-proxy`: a credential-free stdio/Unix-socket bridge spawned
 //!   inside an agent sandbox. The trusted MCP broker stays in the
 //!   parent worker process.
+//! - `model-proxy`: a credential-free loopback/Unix-socket bridge that
+//!   supervises one sandboxed agent while provider authority stays in
+//!   the parent worker's per-job model broker.
 
 use std::ffi::OsString;
 use std::net::SocketAddr;
@@ -44,7 +47,7 @@ enum Cmd {
 	/// Bridge MCP stdio to one host-side Unix socket. This subcommand
 	/// receives no server URL, mTLS credentials, job id, or capability.
 	McpProxy(McpProxyArgs),
-	/// Relay one sandbox-local model API connection to its job broker,
+	/// Relay bounded sandbox-local model API connections to its job broker,
 	/// then supervise the agent command in the same network namespace.
 	ModelProxy(ModelProxyArgs),
 	/// Internal supervisor for one isolated sandbox network.
@@ -425,7 +428,7 @@ async fn run_model_proxy(args: ModelProxyArgs) -> Result<std::process::ExitStatu
 
 	let proxy = ModelProxy::bind(args.socket, args.listen, &args.port_file).await?;
 	let base_url = proxy.base_url();
-	let mut relay = tokio::spawn(proxy.relay_one());
+	let mut relay = tokio::spawn(proxy.relay());
 	let (program, command_args) = args.command.split_first().expect("clap requires a command");
 	let mut child = tokio::process::Command::new(program);
 	child.args(

@@ -28,7 +28,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixListener;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::sandbox::SandboxBuilder;
@@ -37,6 +37,7 @@ pub const SANDBOX_MODEL_DIR: &str = "/loupe/model";
 pub const SANDBOX_MODEL_SOCKET: &str = "/loupe/model/session.sock";
 
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ADAPTER_CONNECTIONS: usize = 16;
 const BROKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const BROKER_ERROR_TRAILER: &str = "loupe-broker-error";
 
@@ -337,13 +338,17 @@ impl ModelBrokerSession {
 		let listener = UnixListener::bind(&socket_path)
 			.with_context(|| format!("binding model broker socket at {}", socket_path.display()))?;
 		let usage = Arc::new(UsageCounters::default());
+		let http = reqwest::Client::builder()
+			.redirect(reqwest::redirect::Policy::none())
+			.build()
+			.context("building model broker HTTP client")?;
 		let state = Arc::new(BrokerState {
 			backend,
 			upstream,
 			credential,
 			limits,
 			usage: usage.clone(),
-			http: reqwest::Client::new(),
+			http,
 		});
 		let shutdown = CancellationToken::new();
 		let task_shutdown = shutdown.clone();
@@ -392,18 +397,41 @@ impl Drop for ModelBrokerSession {
 async fn serve_session(
 	listener: UnixListener, state: Arc<BrokerState>, shutdown: CancellationToken,
 ) -> Result<()> {
-	let accepted = tokio::select! {
-		biased;
-		result = listener.accept() => Some(result.context("accepting model proxy connection")?),
-		_ = shutdown.cancelled() => None,
-	};
-	let Some((stream, _)) = accepted else { return Ok(()) };
-	// A model session has exactly one sandbox-side adapter. Dropping the
-	// listener here makes a second connection fail even while the first is
-	// still serving multiple HTTP requests.
-	drop(listener);
-	let service_state = state.clone();
-	let service = service_fn(move |request| proxy_request(request, service_state.clone()));
+	let mut connections = JoinSet::new();
+	loop {
+		tokio::select! {
+			biased;
+			_ = shutdown.cancelled() => break,
+			Some(result) = connections.join_next(), if !connections.is_empty() => {
+				match result {
+					Ok(Ok(())) => {},
+					Ok(Err(error)) => tracing::debug!(%error, "model adapter connection ended"),
+					Err(error) => tracing::warn!(%error, "model adapter connection task failed"),
+				}
+			},
+			result = listener.accept() => {
+				let (stream, _) = result.context("accepting model proxy connection")?;
+				if connections.len() >= MAX_ADAPTER_CONNECTIONS {
+					tracing::warn!(limit = MAX_ADAPTER_CONNECTIONS, "model adapter connection limit reached");
+					continue;
+				}
+				let connection_state = state.clone();
+				let connection_shutdown = shutdown.clone();
+				connections.spawn(async move {
+					serve_adapter_connection(stream, connection_state, connection_shutdown).await
+				});
+			},
+		}
+	}
+	connections.abort_all();
+	while connections.join_next().await.is_some() {}
+	Ok(())
+}
+
+async fn serve_adapter_connection(
+	stream: tokio::net::UnixStream, state: Arc<BrokerState>, shutdown: CancellationToken,
+) -> Result<()> {
+	let service = service_fn(move |request| proxy_request(request, state.clone()));
 	let connection = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
 	tokio::pin!(connection);
 	tokio::select! {
@@ -426,17 +454,31 @@ async fn proxy_request(
 async fn handle_request(
 	request: Request<Incoming>, state: Arc<BrokerState>,
 ) -> Result<Response<BrokerBody>> {
-	let endpoint = state.backend.provider().endpoint();
-	if request.method() != Method::POST
-		|| request.uri().path() != endpoint
-		|| request.uri().query().is_some()
+	if state.backend.provider() == ModelProvider::Claude
+		&& request.method() == Method::HEAD
+		&& request.uri().path() == "/api/hello"
+		&& request.uri().query().is_none()
 	{
+		// Claude Code uses this as a connectivity preflight before
+		// Messages. Answer locally: the sandbox learns only that its own
+		// job-scoped adapter is alive, and no provider authority is spent.
+		return Ok(empty_response(StatusCode::OK));
+	}
+	let provider = state.backend.provider();
+	let endpoint = provider.endpoint();
+	let query = request.uri().query();
+	let query_allowed = match provider {
+		ModelProvider::Claude => query.is_none() || query == Some("beta=true"),
+		ModelProvider::Codex => query.is_none(),
+	};
+	if request.method() != Method::POST || request.uri().path() != endpoint || !query_allowed {
 		return Ok(local_error(
 			StatusCode::NOT_FOUND,
 			"endpoint_not_allowed",
 			"endpoint not allowed",
 		));
 	}
+	let query = query.map(str::to_owned);
 
 	let headers = sanitize_request_headers(request.headers(), &state.credential)?;
 	let body = match Limited::new(request.into_body(), MAX_REQUEST_BODY_BYTES).collect().await {
@@ -473,7 +515,7 @@ async fn handle_request(
 
 	let mut upstream = state.upstream.clone();
 	upstream.set_path(endpoint);
-	upstream.set_query(None);
+	upstream.set_query(query.as_deref());
 	upstream.set_fragment(None);
 	let response = state
 		.http
@@ -483,6 +525,13 @@ async fn handle_request(
 		.send()
 		.await
 		.context("sending model request to configured upstream")?;
+	if response.status().is_redirection() {
+		return Ok(local_error(
+			StatusCode::BAD_GATEWAY,
+			"upstream_redirect_denied",
+			"model upstream redirects are not allowed",
+		));
+	}
 	Ok(stream_upstream_response(response, state))
 }
 
@@ -759,6 +808,13 @@ fn local_error(
 	response
 }
 
+fn empty_response(status: StatusCode) -> Response<BrokerBody> {
+	let body = Full::new(Bytes::new()).map_err(|never| match never {}).boxed_unsync();
+	let mut response = Response::new(body);
+	*response.status_mut() = status;
+	response
+}
+
 #[cfg(test)]
 mod tests {
 	use std::sync::Arc;
@@ -793,6 +849,7 @@ mod tests {
 	struct FakeUpstream {
 		url: reqwest::Url,
 		requests: CapturedRequests,
+		response: FakeResponse,
 	}
 
 	impl FakeUpstream {
@@ -802,7 +859,12 @@ mod tests {
 			let state = (requests.clone(), response.clone());
 			let app = Router::new().fallback(any(
 				|State((requests, response)): State<FakeState>, request: Request| async move {
-					let path = request.uri().path().to_owned();
+					let path = request
+						.uri()
+						.path_and_query()
+						.map(|value| value.as_str())
+						.unwrap_or(request.uri().path())
+						.to_owned();
 					let headers = request.headers().clone();
 					let body = to_bytes(request.into_body(), usize::MAX).await.unwrap();
 					requests.lock().await.push(CapturedRequest { path, headers, body });
@@ -818,11 +880,18 @@ mod tests {
 			tokio::spawn(async move {
 				axum::serve(listener, app.with_state(state)).await.unwrap();
 			});
-			Self { url: format!("http://{address}").parse().unwrap(), requests }
+			Self { url: format!("http://{address}").parse().unwrap(), requests, response }
 		}
 
 		async fn captured(&self) -> Vec<CapturedRequest> {
 			self.requests.lock().await.clone()
+		}
+
+		async fn respond_with(
+			&self, status: StatusCode, headers: HeaderMap, body: impl Into<Bytes>,
+		) {
+			let mut response = self.response.lock().await;
+			*response = (status, headers, body.into());
 		}
 	}
 
@@ -862,8 +931,18 @@ mod tests {
 		}
 	}
 
+	fn bwrap_present() -> bool {
+		std::process::Command::new("bwrap")
+			.arg("--version")
+			.stdout(std::process::Stdio::null())
+			.stderr(std::process::Stdio::null())
+			.status()
+			.map(|status| status.success())
+			.unwrap_or(false)
+	}
+
 	#[tokio::test]
-	async fn session_accepts_one_connection_and_finish_revokes_it() {
+	async fn session_accepts_job_scoped_connections_and_finish_revokes_them() {
 		let upstream = FakeUpstream::start("{}").await;
 		let session = ModelBrokerSession::start(
 			claude_backend(),
@@ -880,10 +959,86 @@ mod tests {
 		assert_eq!(response.status(), StatusCode::NOT_FOUND);
 		response.into_body().collect().await.unwrap();
 
-		let second = UnixStream::connect(session.socket_path()).await;
-		assert!(second.is_err(), "a second client connected to a per-job session");
+		let mut second = connect(&session).await;
+		let response = second.send_request(request("/still-not-allowed", "{}")).await.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_FOUND);
+		response.into_body().collect().await.unwrap();
 
 		session.finish().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn finish_revokes_connected_adapter_authority() {
+		let upstream = FakeUpstream::start("{}").await;
+		let session = ModelBrokerSession::start(
+			claude_backend(),
+			upstream.url,
+			ModelCredential::anthropic_api_key("host-secret"),
+			limits(),
+		)
+		.await
+		.unwrap();
+		let mut client = connect(&session).await;
+
+		session.finish().await.unwrap();
+
+		let result = client.send_request(request("/v1/messages", "{}")).await;
+		assert!(result.is_err(), "a connected adapter retained authority after broker finish");
+	}
+
+	#[tokio::test]
+	async fn sandbox_mount_exposes_only_its_own_job_socket() {
+		if !bwrap_present() {
+			eprintln!("skipping: bwrap missing");
+			return;
+		}
+		let upstream = FakeUpstream::start("{}").await;
+		let session_a = ModelBrokerSession::start(
+			claude_backend(),
+			upstream.url.clone(),
+			ModelCredential::anthropic_api_key("host-secret-a"),
+			limits(),
+		)
+		.await
+		.unwrap();
+		let session_b = ModelBrokerSession::start(
+			claude_backend(),
+			upstream.url.clone(),
+			ModelCredential::anthropic_api_key("host-secret-b"),
+			limits(),
+		)
+		.await
+		.unwrap();
+		assert_ne!(session_a.socket_path(), session_b.socket_path());
+
+		let workdir = tempfile::tempdir().unwrap();
+		let context = ModelBrokerContext::new(
+			"/bin/true".into(),
+			upstream.url,
+			ModelCredential::anthropic_api_key("unused-host-secret"),
+			limits(),
+		);
+		let sandbox =
+			bind_model_into_sandbox(SandboxBuilder::new(workdir.path()), &context, &session_a);
+		let output = sandbox
+			.build("/bin/sh")
+			.args([
+				"-c",
+				"test -S /loupe/model/session.sock && test ! -e \"$1\"",
+				"socket-isolation-check",
+			])
+			.arg(session_b.socket_path())
+			.output()
+			.await
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"job A sandbox could see job B socket: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+
+		session_a.finish().await.unwrap();
+		session_b.finish().await.unwrap();
 	}
 
 	#[tokio::test]
@@ -914,6 +1069,57 @@ mod tests {
 			response.into_body().collect().await.unwrap();
 		}
 		assert!(upstream.captured().await.is_empty());
+		session.finish().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn claude_connectivity_probe_stays_local() {
+		let upstream = FakeUpstream::start("{}").await;
+		let session = ModelBrokerSession::start(
+			claude_backend(),
+			upstream.url.clone(),
+			ModelCredential::anthropic_api_key("host-secret"),
+			limits(),
+		)
+		.await
+		.unwrap();
+		let mut client = connect(&session).await;
+		let probe = HyperRequest::builder()
+			.method(Method::HEAD)
+			.uri("/api/hello")
+			.body(Full::new(Bytes::new()))
+			.unwrap();
+
+		let response = client.send_request(probe).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert!(upstream.captured().await.is_empty());
+		assert_eq!(session.usage(), ModelBrokerUsage::default());
+		session.finish().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn claude_beta_query_is_forwarded() {
+		let upstream = FakeUpstream::start("{}").await;
+		let session = ModelBrokerSession::start(
+			claude_backend(),
+			upstream.url.clone(),
+			ModelCredential::anthropic_api_key("host-secret"),
+			limits(),
+		)
+		.await
+		.unwrap();
+		let mut client = connect(&session).await;
+
+		let response = client
+			.send_request(request(
+				"/v1/messages?beta=true",
+				r#"{"model":"claude-test","messages":[],"max_tokens":8}"#,
+			))
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		response.into_body().collect().await.unwrap();
+		assert_eq!(upstream.captured().await[0].path, "/v1/messages?beta=true");
 		session.finish().await.unwrap();
 	}
 
@@ -1148,6 +1354,39 @@ mod tests {
 			assert_eq!(captured[0].body.as_ref(), allowed.as_bytes());
 			session.finish().await.unwrap();
 		}
+	}
+
+	#[tokio::test]
+	async fn upstream_redirect_cannot_move_host_auth_to_another_origin() {
+		let redirect_target = FakeUpstream::start("{}").await;
+		let origin = FakeUpstream::start("unused").await;
+		let mut headers = HeaderMap::new();
+		headers.insert(
+			hyper::header::LOCATION,
+			HeaderValue::from_str(&format!("{}/stolen", redirect_target.url)).unwrap(),
+		);
+		origin.respond_with(StatusCode::TEMPORARY_REDIRECT, headers, "redirecting").await;
+		let session = ModelBrokerSession::start(
+			codex_backend(),
+			origin.url.clone(),
+			ModelCredential::openai_api_key("host-secret"),
+			limits(),
+		)
+		.await
+		.unwrap();
+		let mut client = connect(&session).await;
+
+		let response = client
+			.send_request(request(
+				"/v1/responses",
+				r#"{"model":"gpt-test","reasoning":{"effort":"high"},"input":"hi"}"#,
+			))
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+		assert!(redirect_target.captured().await.is_empty(), "host auth followed a redirect");
+		session.finish().await.unwrap();
 	}
 
 	#[tokio::test]

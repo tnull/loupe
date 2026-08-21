@@ -7,8 +7,8 @@
 //! because the sandbox is the security boundary, not the CLI's
 //! permission system.
 //!
-//! Network is allowed through the sandbox so the CLI can reach
-//! api.anthropic.com.
+//! Model traffic reaches a loopback adapter in the private sandbox network;
+//! the host-side broker alone connects to the provider API.
 //!
 //! When constructed with [`McpContext`], each invocation writes a
 //! per-call MCP config and passes `--mcp-config` to claude. The
@@ -33,8 +33,6 @@ use super::model_broker::{
 };
 use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::{SandboxBuilder, SandboxNetworkConfig};
-
-const PROVIDER_API_HOST: &str = "api.anthropic.com";
 
 const BACKEND_ID: &str = "claude-cli";
 const CLAUDE_BIN: &str = "claude";
@@ -251,10 +249,14 @@ impl LlmBackend for ClaudeCliBackend {
 				.as_ref()
 				.filter(|ctx| ctx.bkb_mcp_path.is_some())
 				.map(|ctx| ctx.bkb_api_url.as_str());
-			let required_hosts = super::required_network_hosts(PROVIDER_API_HOST, bkb_api_url)?;
-			sandbox_builder
-				.with_network(self.network.clone(), required_hosts)
-				.with_network_supervisor(model_context.worker_binary())
+			let required_hosts = super::required_network_hosts(bkb_api_url)?;
+			if super::sandbox_requires_egress_setup(&self.network, &required_hosts) {
+				sandbox_builder
+					.with_network(self.network.clone(), required_hosts)
+					.with_network_supervisor(model_context.worker_binary())
+			} else {
+				sandbox_builder
+			}
 		} else {
 			sandbox_builder
 		};
@@ -489,6 +491,7 @@ fn claude_invocation_args(agent: &CliModelConfig, prompt: &str) -> Vec<String> {
 		agent.model.clone(),
 		"--effort".to_owned(),
 		agent.effort.clone(),
+		"--no-session-persistence".to_owned(),
 		"-p".to_owned(),
 		prompt.to_owned(),
 	]
@@ -758,6 +761,7 @@ mod tests {
 
 		assert!(args.windows(2).any(|w| w == ["--model", "claude-test"]));
 		assert!(args.windows(2).any(|w| w == ["--effort", "xhigh"]));
+		assert!(args.iter().any(|arg| arg == "--no-session-persistence"));
 		assert!(args.windows(2).any(|w| w == ["-p", "hello"]));
 	}
 }

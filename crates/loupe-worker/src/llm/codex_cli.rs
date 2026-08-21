@@ -38,8 +38,6 @@ use super::model_broker::{
 use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::{SandboxBuilder, SandboxNetworkConfig};
 
-const PROVIDER_API_HOST: &str = "api.openai.com";
-
 const BACKEND_ID: &str = "codex-cli";
 const CODEX_BIN: &str = "codex";
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
@@ -47,7 +45,7 @@ pub const DEFAULT_CODEX_EFFORT: &str = "xhigh";
 const MAX_CLI_DIAGNOSTIC_CHARS: usize = 2_000;
 const MODEL_PROXY_LISTEN: &str = "127.0.0.1:0";
 const SANDBOX_MODEL_PORT_FILE: &str = "/tmp/loupe-model.port";
-const MODEL_BASE_URL_PLACEHOLDER: &str = "@LOUPE_MODEL_BASE_URL@";
+const MODEL_RESPONSES_BASE_URL: &str = "@LOUPE_MODEL_BASE_URL@/v1";
 
 /// Render a Rust string as a TOML basic-string literal: wraps in
 /// double quotes, escapes the few characters TOML cares about (`\`,
@@ -216,10 +214,14 @@ impl LlmBackend for CodexCliBackend {
 				.as_ref()
 				.filter(|ctx| ctx.bkb_mcp_path.is_some())
 				.map(|ctx| ctx.bkb_api_url.as_str());
-			let required_hosts = super::required_network_hosts(PROVIDER_API_HOST, bkb_api_url)?;
-			sandbox_builder
-				.with_network(self.network.clone(), required_hosts)
-				.with_network_supervisor(model_context.worker_binary())
+			let required_hosts = super::required_network_hosts(bkb_api_url)?;
+			if super::sandbox_requires_egress_setup(&self.network, &required_hosts) {
+				sandbox_builder
+					.with_network(self.network.clone(), required_hosts)
+					.with_network_supervisor(model_context.worker_binary())
+			} else {
+				sandbox_builder
+			}
 		} else {
 			sandbox_builder
 		};
@@ -449,10 +451,7 @@ fn codex_model_provider_overrides() -> [String; 5] {
 	[
 		format!("model_provider={}", toml_string_literal("loupe")),
 		format!("model_providers.loupe.name={}", toml_string_literal("Loupe broker")),
-		format!(
-			"model_providers.loupe.base_url={}",
-			toml_string_literal(MODEL_BASE_URL_PLACEHOLDER)
-		),
+		format!("model_providers.loupe.base_url={}", toml_string_literal(MODEL_RESPONSES_BASE_URL)),
 		format!("model_providers.loupe.env_key={}", toml_string_literal("CODEX_API_KEY")),
 		format!("model_providers.loupe.wire_api={}", toml_string_literal("responses")),
 	]
@@ -465,6 +464,8 @@ fn codex_invocation_args(
 		"exec".to_owned(),
 		"--dangerously-bypass-approvals-and-sandbox".to_owned(),
 		"--skip-git-repo-check".to_owned(),
+		"--ephemeral".to_owned(),
+		"--ignore-user-config".to_owned(),
 		"--model".to_owned(),
 		agent.model.clone(),
 		"-c".to_owned(),
@@ -754,10 +755,12 @@ mod tests {
 		);
 
 		assert!(args.windows(2).any(|w| w == ["--model", "gpt-test"]));
+		assert!(args.iter().any(|arg| arg == "--ephemeral"));
+		assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
 		assert!(args.windows(2).any(|w| w == ["-c", r#"model_reasoning_effort="xhigh""#]));
 		assert!(args.windows(2).any(|w| w == ["-c", r#"model_provider="loupe""#]));
 		assert!(args.windows(2).any(|w| {
-			w == ["-c", r#"model_providers.loupe.base_url="@LOUPE_MODEL_BASE_URL@""#]
+			w == ["-c", r#"model_providers.loupe.base_url="@LOUPE_MODEL_BASE_URL@/v1""#]
 		}));
 		assert!(args
 			.windows(2)

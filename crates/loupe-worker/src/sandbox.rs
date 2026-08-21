@@ -224,10 +224,9 @@ impl SandboxBuilder {
 		self
 	}
 
-	/// Forward an env var into the sandbox. The value is looked up
-	/// from the worker's own environment at `build()` time. Use for
-	/// things like `ANTHROPIC_API_KEY` that the agent reads to
-	/// authenticate.
+	/// Forward a non-secret env var into the sandbox. The value is looked up
+	/// from the worker's own environment at `build()` time. Provider credentials
+	/// must remain in a host-side broker and must never use this path.
 	pub fn forward_env(mut self, name: &'static str) -> Self {
 		self.forward_env.push(name);
 		self

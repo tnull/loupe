@@ -1,14 +1,17 @@
 //! Credential-free loopback adapter used inside an agent sandbox.
 //!
-//! The adapter accepts one local TCP connection and relays it to the
-//! per-job model broker Unix socket. It has no provider destination or
-//! credential of its own.
+//! The adapter accepts a bounded set of local TCP connections and relays
+//! each to the per-job model broker Unix socket. It has no provider
+//! destination or credential of its own.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use tokio::net::{TcpListener, UnixStream};
+use tokio::task::JoinSet;
+
+const MAX_BROKER_CONNECTIONS: usize = 16;
 
 #[derive(Debug)]
 pub struct ModelProxy {
@@ -39,20 +42,41 @@ impl ModelProxy {
 		format!("http://{}", self.local_addr())
 	}
 
-	pub async fn relay_one(self) -> Result<()> {
-		let (mut tcp, peer) =
-			self.listener.accept().await.context("accepting model API connection")?;
-		if !peer.ip().is_loopback() {
-			anyhow::bail!("model proxy refused a non-loopback peer");
+	pub async fn relay(self) -> Result<()> {
+		let mut connections = JoinSet::new();
+		loop {
+			tokio::select! {
+				biased;
+				Some(result) = connections.join_next(), if !connections.is_empty() => {
+					match result.context("model proxy connection task panicked")? {
+						Ok(()) => {},
+						Err(error) => tracing::debug!(%error, "model proxy client connection ended"),
+					}
+				},
+				accepted = self.listener.accept() => {
+					let (tcp, peer) = accepted.context("accepting model API connection")?;
+					if !peer.ip().is_loopback() {
+						anyhow::bail!("model proxy refused a non-loopback peer");
+					}
+					if connections.len() >= MAX_BROKER_CONNECTIONS {
+						tracing::warn!(limit = MAX_BROKER_CONNECTIONS, "model proxy connection limit reached");
+						continue;
+					}
+					let unix = UnixStream::connect(&self.socket_path).await.with_context(|| {
+						format!("connecting model broker socket at {}", self.socket_path.display())
+					})?;
+					connections.spawn(relay_connection(tcp, unix));
+				},
+			}
 		}
-		let mut unix = UnixStream::connect(&self.socket_path).await.with_context(|| {
-			format!("connecting model broker socket at {}", self.socket_path.display())
-		})?;
-		tokio::io::copy_bidirectional(&mut tcp, &mut unix)
-			.await
-			.context("relaying model API connection")?;
-		Ok(())
 	}
+}
+
+async fn relay_connection(mut tcp: tokio::net::TcpStream, mut unix: UnixStream) -> Result<()> {
+	tokio::io::copy_bidirectional(&mut tcp, &mut unix)
+		.await
+		.context("relaying model API connection")?;
+	Ok(())
 }
 
 #[cfg(test)]
@@ -65,16 +89,18 @@ mod tests {
 	use super::*;
 
 	#[tokio::test]
-	async fn relays_one_loopback_connection_to_the_job_socket() {
+	async fn relays_multiple_loopback_connections_to_the_job_socket() {
 		let scratch = tempfile::tempdir().unwrap();
 		let socket = scratch.path().join("broker.sock");
 		let unix = UnixListener::bind(&socket).unwrap();
 		let echo = tokio::spawn(async move {
-			let (mut stream, _) = unix.accept().await.unwrap();
-			let mut request = [0; 4];
-			stream.read_exact(&mut request).await.unwrap();
-			assert_eq!(&request, b"ping");
-			stream.write_all(b"pong").await.unwrap();
+			for _ in 0..2 {
+				let (mut stream, _) = unix.accept().await.unwrap();
+				let mut request = [0; 4];
+				stream.read_exact(&mut request).await.unwrap();
+				assert_eq!(&request, b"ping");
+				stream.write_all(b"pong").await.unwrap();
+			}
 		});
 
 		let port_file = scratch.path().join("model.port");
@@ -87,17 +113,20 @@ mod tests {
 		.unwrap();
 		let address = proxy.local_addr();
 		assert_eq!(std::fs::read_to_string(&port_file).unwrap(), format!("{}\n", address.port()));
-		let relay = tokio::spawn(proxy.relay_one());
+		let relay = tokio::spawn(proxy.relay());
 
-		let mut client = TcpStream::connect(address).await.unwrap();
-		client.write_all(b"ping").await.unwrap();
-		let mut response = [0; 4];
-		client.read_exact(&mut response).await.unwrap();
-		assert_eq!(&response, b"pong");
-		client.shutdown().await.unwrap();
+		for _ in 0..2 {
+			let mut client = TcpStream::connect(address).await.unwrap();
+			client.write_all(b"ping").await.unwrap();
+			let mut response = [0; 4];
+			client.read_exact(&mut response).await.unwrap();
+			assert_eq!(&response, b"pong");
+			client.shutdown().await.unwrap();
+		}
 
-		relay.await.unwrap().unwrap();
 		echo.await.unwrap();
+		relay.abort();
+		let _ = relay.await;
 	}
 
 	#[tokio::test]

@@ -40,7 +40,7 @@ use model_broker::{ModelBrokerContext, ModelBrokerLimits, ModelCredential};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::sandbox::SandboxNetworkConfig;
+use crate::sandbox::{SandboxNetworkConfig, SandboxNetworkMode};
 
 const ANTHROPIC_UPSTREAM_URL: &str = "https://api.anthropic.com";
 const OPENAI_UPSTREAM_URL: &str = "https://api.openai.com";
@@ -335,10 +335,8 @@ fn codex_model_broker_context(runtime: ModelBrokerRuntimeConfig) -> Result<Model
 	))
 }
 
-pub(crate) fn required_network_hosts(
-	provider_host: &str, bkb_api_url: Option<&str>,
-) -> Result<Vec<String>> {
-	let mut hosts = vec![provider_host.to_owned()];
+pub(crate) fn required_network_hosts(bkb_api_url: Option<&str>) -> Result<Vec<String>> {
+	let mut hosts = Vec::new();
 	if let Some(bkb_api_url) = bkb_api_url {
 		let url = reqwest::Url::parse(bkb_api_url)?;
 		let host =
@@ -346,6 +344,14 @@ pub(crate) fn required_network_hosts(
 		hosts.push(host.to_owned());
 	}
 	Ok(hosts)
+}
+
+pub(crate) fn sandbox_requires_egress_setup(
+	network: &SandboxNetworkConfig, required_hosts: &[String],
+) -> bool {
+	network.mode == SandboxNetworkMode::Public
+		|| !network.allowlist.is_empty()
+		|| !required_hosts.is_empty()
 }
 
 fn env_present(name: &str) -> bool {
@@ -611,20 +617,32 @@ mod tests {
 	}
 
 	#[test]
-	fn sandbox_network_always_includes_provider_and_enabled_bkb() {
-		assert_eq!(required_network_hosts("api.openai.com", None).unwrap(), ["api.openai.com"]);
+	fn sandbox_network_only_includes_enabled_bkb() {
+		assert_eq!(required_network_hosts(None).unwrap(), Vec::<String>::new());
 		assert_eq!(
-			required_network_hosts("api.openai.com", Some(mcp::DEFAULT_BKB_API_URL)).unwrap(),
-			["api.openai.com", "bitcoinknowledge.dev"]
+			required_network_hosts(Some(mcp::DEFAULT_BKB_API_URL)).unwrap(),
+			["bitcoinknowledge.dev"]
 		);
 		assert_eq!(
-			required_network_hosts(
-				"api.anthropic.com",
-				Some("https://knowledge.example.test:8443/api"),
-			)
-			.unwrap(),
-			["api.anthropic.com", "knowledge.example.test"]
+			required_network_hosts(Some("https://knowledge.example.test:8443/api")).unwrap(),
+			["knowledge.example.test"]
 		);
+	}
+
+	#[test]
+	fn empty_allowlist_uses_the_private_loopback_namespace() {
+		let model_only =
+			SandboxNetworkConfig { mode: SandboxNetworkMode::Allowlist, allowlist: Vec::new() };
+		assert!(!sandbox_requires_egress_setup(&model_only, &[]));
+		assert!(sandbox_requires_egress_setup(&model_only, &["bkb.example".into()]));
+		assert!(sandbox_requires_egress_setup(
+			&SandboxNetworkConfig {
+				mode: SandboxNetworkMode::Allowlist,
+				allowlist: vec!["docs.example".into()],
+			},
+			&[],
+		));
+		assert!(sandbox_requires_egress_setup(&SandboxNetworkConfig::default(), &[]));
 	}
 
 	#[test]
