@@ -31,6 +31,8 @@ use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::sandbox::SandboxBuilder;
+
 pub const SANDBOX_MODEL_DIR: &str = "/loupe/model";
 pub const SANDBOX_MODEL_SOCKET: &str = "/loupe/model/session.sock";
 
@@ -95,9 +97,51 @@ enum CredentialKind {
 
 /// Host-held provider authentication. Deliberately does not implement
 /// `Debug`, so logging a broker configuration cannot print the secret.
+#[derive(Clone)]
 pub struct ModelCredential {
 	kind: CredentialKind,
 	secret: String,
+}
+
+/// Worker-owned ingredients reused to create a fresh broker session for
+/// each invocation of one backend.
+#[derive(Clone)]
+pub struct ModelBrokerContext {
+	worker_binary: PathBuf,
+	upstream: reqwest::Url,
+	credential: ModelCredential,
+	limits: ModelBrokerLimits,
+}
+
+impl ModelBrokerContext {
+	pub fn new(
+		worker_binary: PathBuf, upstream: reqwest::Url, credential: ModelCredential,
+		limits: ModelBrokerLimits,
+	) -> Self {
+		Self { worker_binary, upstream, credential, limits }
+	}
+
+	pub async fn start_session(&self, backend: ModelBrokerBackend) -> Result<ModelBrokerSession> {
+		ModelBrokerSession::start(
+			backend,
+			self.upstream.clone(),
+			self.credential.clone(),
+			self.limits,
+		)
+		.await
+	}
+
+	pub fn worker_binary(&self) -> &Path {
+		&self.worker_binary
+	}
+}
+
+pub fn bind_model_into_sandbox(
+	sandbox: SandboxBuilder, context: &ModelBrokerContext, session: &ModelBrokerSession,
+) -> SandboxBuilder {
+	sandbox
+		.bind_ro(context.worker_binary.clone(), super::mcp::SANDBOX_LOUPE_BIN)
+		.bind_ro(session.host_dir(), SANDBOX_MODEL_DIR)
 }
 
 impl ModelCredential {
