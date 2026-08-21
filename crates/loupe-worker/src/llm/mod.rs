@@ -20,6 +20,7 @@
 pub mod claude_cli;
 pub mod codex_cli;
 pub mod mcp;
+pub mod model_broker;
 pub mod prompts;
 
 use std::ffi::OsString;

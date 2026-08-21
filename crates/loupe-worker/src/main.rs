@@ -140,6 +140,15 @@ struct RunArgs {
 	/// BKB HTTP API URL for the optional bkb-mcp child.
 	#[arg(long, env = "LOUPE_BKB_API_URL")]
 	bkb_api_url: Option<String>,
+	/// Maximum model API requests allowed in one broker session.
+	#[arg(long, env = "LOUPE_BROKER_REQUEST_CEILING")]
+	broker_request_ceiling: Option<u64>,
+	/// Maximum model response bytes allowed in one broker session.
+	#[arg(long, env = "LOUPE_BROKER_OUTPUT_CEILING_BYTES")]
+	broker_output_ceiling_bytes: Option<u64>,
+	/// Optional maximum reported model tokens allowed in one broker session.
+	#[arg(long, env = "LOUPE_BROKER_TOKEN_CEILING")]
+	broker_token_ceiling: Option<u64>,
 }
 
 #[derive(Debug, Parser)]
@@ -402,6 +411,9 @@ fn load_worker_config(args: &RunArgs) -> Result<WorkerConfig> {
 			max_file_bytes: args.max_file_bytes,
 			per_request_timeout_seconds: args.per_request_timeout_seconds,
 			bkb_api_url: args.bkb_api_url.clone(),
+			broker_request_ceiling: args.broker_request_ceiling,
+			broker_output_ceiling_bytes: args.broker_output_ceiling_bytes,
+			broker_token_ceiling: args.broker_token_ceiling,
 		},
 	)
 }
