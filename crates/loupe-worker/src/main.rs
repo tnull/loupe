@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use loupe_worker::config::{LoggingConfig, WorkerConfig, WorkerConfigOverrides};
 use loupe_worker::llm::{
 	bkb_mcp_available, build_scan_backend, build_verifier_backend, claude_auth_available,
@@ -169,9 +169,19 @@ struct ModelProxyArgs {
 	listen: SocketAddr,
 	#[arg(long)]
 	port_file: PathBuf,
+	#[arg(long, value_enum, default_value = "claude")]
+	provider: ModelProxyProvider,
 	#[arg(last = true, required = true, allow_hyphen_values = true)]
 	command: Vec<OsString>,
 }
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ModelProxyProvider {
+	Claude,
+	Codex,
+}
+
+const MODEL_BASE_URL_PLACEHOLDER: &str = "@LOUPE_MODEL_BASE_URL@";
 
 #[derive(Debug, Parser)]
 struct SandboxExecArgs {
@@ -418,7 +428,9 @@ async fn run_model_proxy(args: ModelProxyArgs) -> Result<std::process::ExitStatu
 	let mut relay = tokio::spawn(proxy.relay_one());
 	let (program, command_args) = args.command.split_first().expect("clap requires a command");
 	let mut child = tokio::process::Command::new(program);
-	child.args(command_args);
+	child.args(
+		command_args.iter().cloned().map(|argument| replace_model_base_url(argument, &base_url)),
+	);
 	// Fail closed even if this internal mode is invoked outside the
 	// normal Bubblewrap path: the supervised process sees only a fixed,
 	// non-secret gateway sentinel, never a host provider credential.
@@ -428,13 +440,20 @@ async fn run_model_proxy(args: ModelProxyArgs) -> Result<std::process::ExitStatu
 			child.env(name, value);
 		}
 	}
-	child.env("ANTHROPIC_AUTH_TOKEN", "loupe-brokered");
-	child.env("ANTHROPIC_BASE_URL", base_url);
-	child.env("DISABLE_AUTOUPDATER", "1");
-	child.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
-	child.env("DISABLE_TELEMETRY", "1");
-	child.env("DISABLE_ERROR_REPORTING", "1");
-	child.env("DISABLE_BUG_COMMAND", "1");
+	match args.provider {
+		ModelProxyProvider::Claude => {
+			child.env("ANTHROPIC_AUTH_TOKEN", "loupe-brokered");
+			child.env("ANTHROPIC_BASE_URL", base_url);
+			child.env("DISABLE_AUTOUPDATER", "1");
+			child.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+			child.env("DISABLE_TELEMETRY", "1");
+			child.env("DISABLE_ERROR_REPORTING", "1");
+			child.env("DISABLE_BUG_COMMAND", "1");
+		},
+		ModelProxyProvider::Codex => {
+			child.env("CODEX_API_KEY", "loupe-brokered");
+		},
+	}
 	child.kill_on_drop(true);
 	let mut child = child.spawn().context("spawning model-proxied agent command")?;
 
@@ -454,6 +473,13 @@ async fn run_model_proxy(args: ModelProxyArgs) -> Result<std::process::ExitStatu
 				},
 			}
 		},
+	}
+}
+
+fn replace_model_base_url(argument: OsString, base_url: &str) -> OsString {
+	match argument.into_string() {
+		Ok(argument) => OsString::from(argument.replace(MODEL_BASE_URL_PLACEHOLDER, base_url)),
+		Err(argument) => argument,
 	}
 }
 
@@ -700,5 +726,19 @@ mod tests {
 		assert_eq!(args.listen, "127.0.0.1:0".parse().unwrap());
 		assert_eq!(args.port_file, PathBuf::from("/tmp/model.port"));
 		assert_eq!(args.command, [OsString::from("/bin/true")]);
+	}
+
+	#[test]
+	fn model_proxy_replaces_only_the_fixed_base_url_placeholder() {
+		let argument =
+			OsString::from("model_providers.loupe.base_url=\"@LOUPE_MODEL_BASE_URL@/v1\"");
+		assert_eq!(
+			replace_model_base_url(argument, "http://127.0.0.1:3210"),
+			OsString::from("model_providers.loupe.base_url=\"http://127.0.0.1:3210/v1\""),
+		);
+		assert_eq!(
+			replace_model_base_url(OsString::from("unrelated"), "http://127.0.0.1:3210"),
+			OsString::from("unrelated"),
+		);
 	}
 }

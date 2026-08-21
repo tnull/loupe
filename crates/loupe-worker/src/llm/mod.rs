@@ -43,6 +43,7 @@ use tokio_util::sync::CancellationToken;
 use crate::sandbox::SandboxNetworkConfig;
 
 const ANTHROPIC_UPSTREAM_URL: &str = "https://api.anthropic.com";
+const OPENAI_UPSTREAM_URL: &str = "https://api.openai.com";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliModelConfig {
@@ -318,6 +319,22 @@ pub(crate) fn codex_api_key_env() -> Option<OsString> {
 	env_value("CODEX_API_KEY").or_else(|| env_value("OPENAI_API_KEY"))
 }
 
+fn codex_model_broker_context(runtime: ModelBrokerRuntimeConfig) -> Result<ModelBrokerContext> {
+	let secret = if let Some(secret) = utf8_env_value("CODEX_API_KEY")? {
+		secret
+	} else if let Some(secret) = utf8_env_value("OPENAI_API_KEY")? {
+		secret
+	} else {
+		anyhow::bail!("Codex model broker requires CODEX_API_KEY or OPENAI_API_KEY");
+	};
+	Ok(ModelBrokerContext::new(
+		runtime.worker_binary,
+		OPENAI_UPSTREAM_URL.parse().expect("static OpenAI upstream URL is valid"),
+		ModelCredential::openai_api_key(secret),
+		runtime.limits,
+	))
+}
+
 pub(crate) fn required_network_hosts(
 	provider_host: &str, bkb_api_url: Option<&str>,
 ) -> Result<Vec<String>> {
@@ -401,7 +418,13 @@ pub fn build_scan_backend(
 				effort = %codex_agent.effort,
 				"scan backend: codex (configured)"
 			);
-			Ok(Some(build_codex_backend(mcp, codex_agent, network, log_agent_output)))
+			Ok(Some(build_codex_backend(
+				mcp,
+				codex_agent,
+				network,
+				log_agent_output,
+				model_broker,
+			)?))
 		},
 	}
 }
@@ -432,7 +455,7 @@ pub fn build_verifier_backend(
 				effort = %codex_agent.effort,
 				"verifier backend: codex (auto)"
 			);
-			Ok(build_codex_backend(mcp, codex_agent, network, log_agent_output))
+			Ok(build_codex_backend(mcp, codex_agent, network, log_agent_output, model_broker)?)
 		},
 		JobAgent::Auto if claude_ready => {
 			tracing::info!(
@@ -459,7 +482,7 @@ pub fn build_verifier_backend(
 				effort = %codex_agent.effort,
 				"verifier backend: codex (configured)"
 			);
-			Ok(build_codex_backend(mcp, codex_agent, network, log_agent_output))
+			Ok(build_codex_backend(mcp, codex_agent, network, log_agent_output, model_broker)?)
 		},
 	}
 }
@@ -493,8 +516,8 @@ fn build_claude_backend(
 
 fn build_codex_backend(
 	mcp: Option<McpContext>, agent: CliModelConfig, network: SandboxNetworkConfig,
-	log_agent_output: bool,
-) -> Arc<dyn LlmBackend> {
+	log_agent_output: bool, model_broker: Option<ModelBrokerRuntimeConfig>,
+) -> Result<Arc<dyn LlmBackend>> {
 	let mut backend = CodexCliBackend::new()
 		.with_agent_config(agent)
 		.with_network_config(network)
@@ -502,7 +525,10 @@ fn build_codex_backend(
 	if let Some(ctx) = mcp {
 		backend = backend.with_mcp_context(ctx);
 	}
-	Arc::new(backend)
+	if let Some(runtime) = model_broker {
+		backend = backend.with_model_broker_context(codex_model_broker_context(runtime)?);
+	}
+	Ok(Arc::new(backend))
 }
 
 #[cfg(test)]

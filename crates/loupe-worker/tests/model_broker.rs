@@ -12,7 +12,7 @@ use axum::response::Response;
 use axum::routing::post;
 use axum::Router;
 use loupe_worker::llm::model_broker::{ModelBrokerContext, ModelBrokerLimits, ModelCredential};
-use loupe_worker::llm::{ClaudeCliBackend, LlmBackend, LlmRequest};
+use loupe_worker::llm::{ClaudeCliBackend, CodexCliBackend, LlmBackend, LlmRequest};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -122,4 +122,111 @@ async fn claude_reaches_fake_upstream_only_through_the_broker() {
 	let body: serde_json::Value = serde_json::from_slice(&captured[0].body).unwrap();
 	assert_eq!(body["model"], "claude-opus-4-7");
 	assert_eq!(body["output_config"]["effort"], "max");
+}
+
+#[tokio::test]
+async fn codex_reaches_fake_upstream_only_through_the_broker() {
+	use std::os::unix::fs::PermissionsExt;
+
+	if !bwrap_present() {
+		eprintln!("skipping: bwrap missing");
+		return;
+	}
+	let worker_binary = PathBuf::from(env!("CARGO_BIN_EXE_loupe-worker"));
+	let network_probe = tempfile::tempdir().unwrap();
+	if let Err(error) = loupe_worker::sandbox::smoketest_with_supervisor(
+		network_probe.path(),
+		Default::default(),
+		worker_binary.clone(),
+	) {
+		eprintln!("skipping: isolated sandbox networking unavailable: {error:#}");
+		return;
+	}
+
+	let captured = Arc::new(Mutex::new(Vec::<Captured>::new()));
+	let app = Router::new()
+		.route(
+			"/v1/responses",
+			post(
+				|State(captured): State<Arc<Mutex<Vec<Captured>>>>, request: Request| async move {
+					let headers = request.headers().clone();
+					let body = to_bytes(request.into_body(), 1024 * 1024).await.unwrap().to_vec();
+					captured.lock().await.push(Captured { headers, body });
+					Response::new(Body::from("BROKERED-CODEX"))
+				},
+			),
+		)
+		.with_state(captured.clone());
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let upstream: reqwest::Url =
+		format!("http://{}", listener.local_addr().unwrap()).parse().unwrap();
+	tokio::spawn(async move {
+		axum::serve(listener, app).await.unwrap();
+	});
+
+	let scratch = tempfile::tempdir().unwrap();
+	let workdir = tempfile::tempdir().unwrap();
+	std::fs::create_dir(workdir.path().join(".codex")).unwrap();
+	std::fs::write(
+		workdir.path().join(".codex/config.toml"),
+		"model_provider = \"hostile\"\nmodel = \"repo-controlled\"\n",
+	)
+	.unwrap();
+	let fake_codex = scratch.path().join("fake-codex");
+	std::fs::write(
+		&fake_codex,
+		r#"#!/bin/sh
+if [ -n "${OPENAI_API_KEY-}" ] || [ "${CODEX_API_KEY-}" != "loupe-brokered" ]; then
+  echo credential-leaked >&2
+  exit 90
+fi
+base_url=
+for argument in "$@"; do
+  case "$argument" in
+    model_providers.loupe.base_url=*)
+      value=${argument#*=}
+      value=${value#\"}
+      base_url=${value%\"}
+      ;;
+  esac
+done
+case "$base_url" in
+  http://127.0.0.1:*) ;;
+  *) echo missing-loopback-provider >&2; exit 91 ;;
+esac
+exec /usr/bin/curl --silent --show-error --fail-with-body -X POST "${base_url}/v1/responses" -H 'content-type: application/json' -H 'authorization: Bearer loupe-brokered' --data '{"model":"repo-controlled","reasoning":{"effort":"low"},"input":"test"}'
+"#,
+	)
+	.unwrap();
+	std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+	let context = ModelBrokerContext::new(
+		worker_binary,
+		upstream,
+		ModelCredential::openai_api_key("host-openai-secret"),
+		ModelBrokerLimits::default(),
+	);
+	let backend =
+		CodexCliBackend::with_bin(fake_codex.to_string_lossy()).with_model_broker_context(context);
+	let response = backend
+		.run(LlmRequest {
+			prompt: "ignored by fake CLI".into(),
+			workdir: workdir.path().to_path_buf(),
+			timeout: Duration::from_secs(10),
+			cancel: CancellationToken::new(),
+			repo_id: None,
+			job_id: None,
+			job_capability: None,
+			finding_id: None,
+		})
+		.await
+		.expect("Codex must run through the real sandbox supervisor and model proxy");
+	assert_eq!(response.text, "BROKERED-CODEX");
+
+	let captured = captured.lock().await;
+	assert_eq!(captured.len(), 1);
+	assert_eq!(captured[0].headers.get("authorization").unwrap(), "Bearer host-openai-secret");
+	let body: serde_json::Value = serde_json::from_slice(&captured[0].body).unwrap();
+	assert_eq!(body["model"], "gpt-5.5");
+	assert_eq!(body["reasoning"]["effort"], "xhigh");
 }
