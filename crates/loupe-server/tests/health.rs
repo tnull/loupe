@@ -92,6 +92,33 @@ async fn server_rejects_unsupported_protocol_header() {
 }
 
 #[tokio::test]
+async fn coordinated_rollout_rejects_v2_and_accepts_v3_headers() {
+	let (handle, client, _addr) = bring_up().await;
+	let old = client
+		.get("https://loupe-server/v1/health")
+		.header(PROTOCOL_VERSION_HEADER, "2")
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(
+		old.status(),
+		reqwest::StatusCode::BAD_REQUEST,
+		"protocol-2 clients must not enter the protocol-3 deployment"
+	);
+	assert_eq!(old.headers()[PROTOCOL_VERSION_HEADER], "3");
+	let current = client
+		.get("https://loupe-server/v1/health")
+		.header(PROTOCOL_VERSION_HEADER, "3")
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(current.status(), reqwest::StatusCode::OK);
+	assert_eq!(current.headers()[PROTOCOL_VERSION_HEADER], "3");
+	assert_eq!(current.json::<serde_json::Value>().await.unwrap()["protocol_version"], 3);
+	handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn server_rejects_client_with_foreign_cert() {
 	let (handle, _, addr) = bring_up().await;
 

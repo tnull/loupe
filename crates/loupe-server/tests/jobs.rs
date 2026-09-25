@@ -50,6 +50,90 @@ async fn review_scheduler_preserves_legacy_verify_first_through_http() {
 	f.handle.shutdown().await;
 }
 
+#[tokio::test]
+async fn phase_advertisements_do_not_open_public_runtime_gates() {
+	use loupe_core::text::policy::Payload;
+	use loupe_core::text::BoundedJson;
+	use loupe_core::JobKind;
+	use loupe_proto::review_lease::{LeaseList, ReviewCapability};
+	use loupe_server::review::campaign;
+	use loupe_server::review::policy::ReviewPolicy;
+	use loupe_storage::scheduler::{self, Band, NewPhaseJob};
+	let f = bring_up_with_repo_and_worker().await;
+	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+		as i64;
+	let ids=f.db.with_conn(|conn| loupe_storage::transaction::immediate(conn,|tx| {
+		let campaign::Opened::Created{campaign_id,job_id}=campaign::open(tx,&campaign::OpenCampaign {
+			repo_id:f.repo_id,trigger:loupe_storage::campaigns::Trigger::Manual,
+			requested_ref:campaign::RequestedRef::Branch("main"),base_sha:None,kind_hint:campaign::KindHint::Incremental,
+		},&ReviewPolicy::default(),now)? else {panic!("created campaign")};
+		let sha="a".repeat(40);
+		let generation_id=campaign::pin(tx,campaign_id,job_id,&sha,now)?;
+		tx.execute("INSERT INTO leads(generation_id,identity_family,identity_anchor,identity_fingerprint,anchored_payload,anchored_digest,commit_sha,created_at) VALUES(?1,'memory-safety','allocation',?2,'{}',?2,?3,?4)",(generation_id,&[7_u8;32][..],&sha,now))?;
+		let lead_id=tx.last_insert_rowid();
+		tx.execute("INSERT INTO findings(repo_id,job_id,scanner_id,severity,title,description,fingerprint,state,created_at) VALUES(?1,?2,'review','high','t','d','phase-gate','validating',?3)",(f.repo_id,job_id,now))?;
+		let finding_id=tx.last_insert_rowid();
+		let mut ids=vec![job_id];
+		for kind in [JobKind::Drilldown,JobKind::Verify] {
+			let recipe=BoundedJson::<Payload>::new(&serde_json::json!({"version":1,"phase":kind.as_str()}).to_string())?;
+			ids.push(scheduler::enqueue_phase(tx,&NewPhaseJob {
+				repo_id:f.repo_id,kind:kind.clone(),campaign_id,generation_id:Some(generation_id),
+				assigned_lead_id:(kind==JobKind::Drilldown).then_some(lead_id),
+				target_finding_id:(kind==JobKind::Verify).then_some(finding_id),continuation_of_job_id:None,
+				band:Band::Urgent,effective_priority:100,eligible_at:now,token_budget:None,recipe:&recipe,handoff:true,
+			},now)?);
+		}
+		Ok(ids)
+	})).unwrap();
+	for review_capabilities in [
+		LeaseList::default(),
+		LeaseList::new(vec![
+			ReviewCapability::Survey,
+			ReviewCapability::Drilldown,
+			ReviewCapability::Verify,
+		])
+		.unwrap(),
+	] {
+		let response = f
+			.worker
+			.post("https://loupe-server/v1/jobs/lease")
+			.json(&LeaseRequest {
+				protocol_version: PROTOCOL_VERSION,
+				capabilities: vec!["verify:llm".into()],
+				review_capabilities,
+				wait_seconds: 0,
+			})
+			.send()
+			.await
+			.unwrap();
+		assert!(response.status().is_success());
+		assert!(matches!(
+			response.json::<LeaseResponse>().await.unwrap(),
+			LeaseResponse::Empty { .. }
+		));
+	}
+	f.db.with_conn(|conn| {
+		for id in ids {
+			let row = loupe_storage::jobs::get(conn, id)?.unwrap();
+			assert_eq!(row.state, JobState::Queued);
+			assert_eq!(row.attempts, 0);
+		}
+		assert_eq!(
+			conn.query_row("SELECT seq FROM scheduler_clock", [], |row| row.get::<_, i64>(0))?,
+			0
+		);
+		Ok(())
+	})
+	.unwrap();
+	let scan = enqueue_scan(&f, f.repo_id).await;
+	assert_eq!(
+		lease_job(&f.worker).await.job_id,
+		scan.job_id,
+		"closed review gates must preserve legacy progress"
+	);
+	f.handle.shutdown().await;
+}
+
 fn client(ca_cert_pem: &str, cert_pem: &str, key_pem: &str, addr: SocketAddr) -> reqwest::Client {
 	reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(ca_cert_pem))
@@ -191,6 +275,7 @@ async fn lease_job(worker: &reqwest::Client) -> LeaseEnvelope {
 		.json(&LeaseRequest {
 			protocol_version: PROTOCOL_VERSION,
 			capabilities: vec!["scan:secrets".into()],
+			review_capabilities: Default::default(),
 			wait_seconds: 0,
 		})
 		.send()
@@ -209,6 +294,7 @@ async fn lease_verify_job(worker: &reqwest::Client) -> LeaseEnvelope {
 		.json(&LeaseRequest {
 			protocol_version: PROTOCOL_VERSION,
 			capabilities: vec!["verify:llm".into()],
+			review_capabilities: Default::default(),
 			wait_seconds: 0,
 		})
 		.send()
@@ -421,6 +507,7 @@ async fn end_to_end_scan_lifecycle() {
 		.json(&LeaseRequest {
 			protocol_version: PROTOCOL_VERSION,
 			capabilities: vec!["scan:secrets".into()],
+			review_capabilities: Default::default(),
 			wait_seconds: 0,
 		})
 		.send()
@@ -915,6 +1002,7 @@ async fn admin_can_cancel_queued_job() {
 		.json(&LeaseRequest {
 			protocol_version: PROTOCOL_VERSION,
 			capabilities: vec!["scan:secrets".into()],
+			review_capabilities: Default::default(),
 			wait_seconds: 0,
 		})
 		.send()
@@ -2197,6 +2285,7 @@ async fn job_capabilities_bind_worker_operations_to_one_lease() {
 			.json(&LeaseRequest {
 				protocol_version: PROTOCOL_VERSION,
 				capabilities: vec!["scan:secrets".into()],
+				review_capabilities: Default::default(),
 				wait_seconds: 0,
 			})
 			.send()
@@ -2414,6 +2503,7 @@ async fn admin_cannot_lease_jobs() {
 		.json(&LeaseRequest {
 			protocol_version: PROTOCOL_VERSION,
 			capabilities: vec![],
+			review_capabilities: Default::default(),
 			wait_seconds: 0,
 		})
 		.send()
@@ -2448,6 +2538,7 @@ async fn long_poll_lease_wakes_on_enqueue() {
 		.json(&LeaseRequest {
 			protocol_version: PROTOCOL_VERSION,
 			capabilities: vec![],
+			review_capabilities: Default::default(),
 			wait_seconds: 5,
 		})
 		.send();
@@ -2487,6 +2578,7 @@ async fn empty_queue_returns_empty_lease_response() {
 		.json(&LeaseRequest {
 			protocol_version: PROTOCOL_VERSION,
 			capabilities: vec![],
+			review_capabilities: Default::default(),
 			wait_seconds: 0,
 		})
 		.send()

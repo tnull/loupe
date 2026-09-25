@@ -346,6 +346,10 @@ See `contrib/docker/README.md` for fresh Debian host prerequisites,
 image builds, two-host deployment, restart behaviour, and the exact
 secret-handling model.
 
+For the coordinated HTTP protocol-3 rollout, follow the
+[protocol upgrade runbook](contrib/upgrading-protocol-v3.md). This foundation
+keeps review-phase claims disabled; it does not activate the v2 harness.
+
 For existing installations moving to schema v3, follow the
 [offline upgrade runbook](contrib/upgrading-schema-v3.md) before deploying the
 new server. Back up first and stop the old server and all workers; queued

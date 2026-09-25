@@ -5,7 +5,7 @@ use thiserror::Error;
 ///
 /// Bump this only on a wire-incompatible change; additive fields don't
 /// require it because of `#[serde(default)]` / `skip_serializing_if`.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Returned by the server (in a 400 body) when a client speaks a version
 /// outside the server's supported window.
@@ -36,6 +36,13 @@ pub fn check_protocol_version(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn phase_protocol_requires_the_coordinated_version_three_rollout() {
+		assert_eq!(PROTOCOL_VERSION, 3, "phase wire contracts require protocol 3");
+		assert!(check_protocol_version(3, PROTOCOL_VERSION, PROTOCOL_VERSION).is_ok());
+		assert!(check_protocol_version(2, PROTOCOL_VERSION, PROTOCOL_VERSION).is_err());
+	}
 
 	#[test]
 	fn current_version_is_in_window() {

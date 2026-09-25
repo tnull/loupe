@@ -135,6 +135,15 @@ impl Runner {
 	async fn execute(
 		&self, env: LeaseEnvelope, cancel: CancellationToken,
 	) -> Result<(Option<String>, usize)> {
+		// An unexpected server response must not fetch repository contents.
+		if matches!(
+			&env.payload,
+			LeasePayload::ReviewSurvey(_)
+				| LeasePayload::ReviewDrilldown(_)
+				| LeasePayload::ReviewVerify(_)
+		) {
+			anyhow::bail!("review lease arrived but phase execution is not enabled");
+		}
 		let key = RepoKey::new(&env.repo.host, &env.repo.owner, &env.repo.repo);
 		let clone_url = env.repo.clone_url.clone();
 		let github_pat = env.github_pat.clone();
@@ -145,6 +154,11 @@ impl Runner {
 		// alternate is still in use.
 
 		match env.payload {
+			LeasePayload::ReviewSurvey(_)
+			| LeasePayload::ReviewDrilldown(_)
+			| LeasePayload::ReviewVerify(_) => {
+				unreachable!("review payloads are rejected before repository access")
+			},
 			LeasePayload::Verify { finding_id, finding, reviewed_sha } => {
 				let Some(reviewed_sha) = reviewed_sha.filter(|sha| !sha.trim().is_empty()) else {
 					self.submit_revision_unavailable_verdict(
@@ -513,6 +527,78 @@ mod tests {
 			.flat_map(|s| s.capabilities().iter().map(|c| (*c).to_owned()))
 			.collect();
 		assert_eq!(caps, vec!["scan:a", "scan:b", "verify:b"]);
+	}
+
+	#[tokio::test]
+	async fn unexpected_review_leases_never_touch_checkout_or_submit_findings() {
+		use serde_json::json;
+		let tmp = tempfile::tempdir().unwrap();
+		let cache_path = tmp.path().join("cache");
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let base = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
+		let client = Arc::new(ServerClient::from_parts(reqwest::Client::new(), base));
+		let cache = Arc::new(RepoCache::new(cache_path.clone(), 1024).unwrap());
+		let runner = Runner::new(client, cache, vec![Arc::new(NeverRunReviewScanner)]);
+		let provenance = json!({"workflow_contract_version":1,"campaign_id":2,"attempt":1,
+			"limits":{"soft_deadline_at":100,"submit_by":100,"hard_deadline_at":200,
+			"token_budget":null,"new_unit_limit":32,"lead_limit":16,"sibling_limit":4}});
+		let generation = json!({"generation_id":3,"commit_sha":"a".repeat(40)});
+		let profile = json!({"profile_version":1,"profile_digest":"b".repeat(64),"profile":{"purpose":"test"}});
+		let evidence = json!({"version":1,"l2_argument":{"attacker_source":"Remote request","control":"Request length",
+			"sink":"Allocation","reachable_path":"Handler calls allocator","trust_boundary":"Request to memory"},
+			"material_locations":[{"role":"sink","file":"src/lib.rs"}],"counterevidence":"Authentication precedes allocation",
+			"assumptions_gaps":"Authenticated attacker","confidence":"medium"});
+		let payloads = [
+			json!({"kind":"review_survey","provenance":provenance,"context":{"recipe":"bootstrap",
+				"target":{"kind":"unresolved"}}}),
+			json!({"kind":"review_drilldown","provenance":provenance,"generation":generation,"profile":profile,
+				"lead":{"lead_id":4,"producer_commit_sha":"a".repeat(40),"identity_family":"memory-safety",
+					"identity_anchor":"request allocation","hypothesis":"Unbounded allocation","source_refs":[{"path":"src/lib.rs"}],
+					"next_proof_step":"Trace allocation","counterevidence":"Authentication","proof_gaps":"No reproducer"}}),
+			json!({"kind":"review_verify","provenance":provenance,"generation":generation,"profile":profile,
+				"finding":{"finding_id":4,"reviewed_commit_sha":"a".repeat(40),"severity":"high",
+					"title":"Unbounded allocation","description":"Requests allocate without a limit",
+					"identity_family":"memory-safety","identity_anchor":"request allocation","evidence":evidence}}),
+		];
+		for payload in payloads {
+			let kind = payload["kind"].as_str().unwrap().to_owned();
+			let env:LeaseEnvelope=serde_json::from_value(json!({"protocol_version":PROTOCOL_VERSION,
+				"job_id":1,"job_capability":"test-capability","repo_id":1,
+				"repo":{"host":"invalid.test","owner":"test","repo":"test","clone_url":format!("file://{}/missing",tmp.path().display())},
+				"head_branch":null,"lease_expires_at":200,"scanner_config":null,"payload":payload})).unwrap();
+			let error = runner.execute(env, CancellationToken::new()).await.unwrap_err();
+			assert_eq!(
+				error.to_string(),
+				"review lease arrived but phase execution is not enabled",
+				"{kind}"
+			);
+			assert_eq!(
+				std::fs::read_dir(&cache_path).unwrap().count(),
+				0,
+				"{kind} accessed repository cache"
+			);
+		}
+		assert!(
+			tokio::time::timeout(Duration::from_millis(20), listener.accept()).await.is_err(),
+			"unsupported phases must not write findings or verdicts"
+		);
+	}
+
+	struct NeverRunReviewScanner;
+	#[async_trait::async_trait]
+	impl Scanner for NeverRunReviewScanner {
+		fn id(&self) -> &'static str {
+			"never-run"
+		}
+		fn capabilities(&self) -> &[&'static str] {
+			&["scan:test", "verify:test"]
+		}
+		async fn scan(&self, _: &ScanContext) -> Result<Vec<loupe_core::Finding>> {
+			panic!("review lease reached legacy scan")
+		}
+		async fn verify(&self, _: &VerifyContext) -> Result<crate::VerifyOutcome> {
+			panic!("review lease reached legacy verify")
+		}
 	}
 
 	fn git(dir: &Path, args: &[&str]) -> String {

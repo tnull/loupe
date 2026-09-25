@@ -368,6 +368,7 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 		.json(&LeaseRequest {
 			protocol_version: PROTOCOL_VERSION,
 			capabilities: vec!["scan:secrets".into()],
+			review_capabilities: Default::default(),
 			wait_seconds: 0,
 		})
 		.send()

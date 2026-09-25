@@ -37,6 +37,10 @@ impl std::fmt::Debug for JobCapability {
 pub struct LeaseRequest {
 	pub protocol_version: u16,
 	pub capabilities: Vec<String>,
+	/// Separate from legacy scanner tags; empty until phase workers exist.
+	#[serde(default)]
+	pub review_capabilities:
+		crate::review_lease::LeaseList<crate::review_lease::ReviewCapability, 3>,
 	#[serde(default)]
 	pub wait_seconds: u32,
 }
@@ -92,6 +96,9 @@ pub enum LeasePayload {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		reviewed_sha: Option<String>,
 	},
+	ReviewSurvey(Box<crate::review_lease::ReviewSurveyLease>),
+	ReviewDrilldown(Box<crate::review_lease::ReviewDrilldownLease>),
+	ReviewVerify(Box<crate::review_lease::ReviewVerifyLease>),
 }
 
 #[cfg(test)]
@@ -182,7 +189,7 @@ mod tests {
 				assert_eq!(*f, finding);
 				assert_eq!(reviewed_sha.as_deref(), Some("abc123"));
 			},
-			LeasePayload::Scan { .. } => panic!("expected Verify payload"),
+			_ => panic!("expected Verify payload"),
 		}
 	}
 
@@ -218,7 +225,7 @@ mod tests {
 		let env: LeaseEnvelope = serde_json::from_str(raw).unwrap();
 		match env.payload {
 			LeasePayload::Verify { reviewed_sha, .. } => assert!(reviewed_sha.is_none()),
-			LeasePayload::Scan { .. } => panic!("expected Verify payload"),
+			_ => panic!("expected Verify payload"),
 		}
 	}
 }
