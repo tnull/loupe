@@ -5,6 +5,9 @@ use loupe_core::text::{BoundedJson, BoundedText};
 use crate::secrets::MasterKey;
 use crate::Db;
 
+#[path = "inventory_tests.rs"]
+mod inventory_tests;
+
 pub(crate) fn fixture() -> Db {
 	let db = Db::open_in_memory(&MasterKey::for_tests()).unwrap();
 	seed(&db);
@@ -31,7 +34,45 @@ pub(crate) fn reason() -> BoundedText<Reason> {
 }
 
 #[test]
-fn inventory_real_paths_win_across_ingestion_batches() {
+fn inventory_raw_and_literal_aliases_survive_ingestion() {
+	use crate::inventory as i;
+	for reverse in [false, true] {
+		let db = fixture();
+		db.with_conn(|conn| {
+			let mut paths = [
+				i::InventoryPath::from_git_bytes(b"bad\xff.rs"),
+				i::InventoryPath::from_git_bytes(b"bad%FF.rs"),
+			];
+			if reverse {
+				paths.reverse();
+			}
+			for path in &paths {
+				i::standalone::insert(
+					conn,
+					1,
+					11,
+					&[i::NewEntry {
+						path,
+						blob_sha: Some("blob"),
+						kind: i::EntryKind::Tracked,
+						disposition: i::Disposition::Unresolved,
+						reason: None,
+						highlighted: false,
+					}],
+					0,
+				)?;
+			}
+			let entries = i::list(conn, 11)?;
+			assert_eq!(entries.len(), 2, "raw and literal identities must both survive ingestion");
+			assert_eq!(entries.iter().filter(|entry| entry.path.representable()).count(), 1);
+			Ok(())
+		})
+		.unwrap();
+	}
+}
+
+#[test]
+fn inventory_literal_paths_do_not_replace_exclusions_or_their_evidence() {
 	use loupe_core::text::{RepoPath, SourceRef};
 
 	use crate::{inventory as i, transaction};
@@ -57,13 +98,17 @@ fn inventory_real_paths_win_across_ingestion_batches() {
 			highlighted: true,
 		};
 		let outcome = i::standalone::insert(conn, 1, 11, &[entry], 1)
-			.expect("real Git paths must supersede earlier encoded exclusions");
-		assert_eq!(outcome.skipped, 1, "count the displaced unrepresentable entry");
+			.expect("literal Git paths coexist with earlier encoded exclusions");
+		assert_eq!(outcome.inserted, 1, "a distinct raw identity owns its own row");
+		assert_eq!(outcome.skipped, 0, "neither alias is discarded");
 		let rows = i::list(conn, 11)?;
-		assert_eq!(rows.len(), 1);
-		assert!(rows[0].path.representable());
-		assert_eq!(rows[0].blob_sha.as_deref(), Some("real-blob"));
-		assert_eq!(rows[0].disposition, i::Disposition::Mapped);
+		assert_eq!(rows.len(), 2);
+		let literal = rows.iter().find(|row| row.path.representable()).unwrap();
+		assert_eq!(literal.blob_sha.as_deref(), Some("real-blob"));
+		assert_eq!(literal.disposition, i::Disposition::Mapped);
+		let exclusion = rows.iter().find(|row| !row.path.representable()).unwrap();
+		assert_eq!(exclusion.blob_sha.as_deref(), Some("invalid-blob"));
+		assert_eq!(exclusion.disposition, i::Disposition::Excluded);
 		transaction::immediate(conn, |tx| {
 			i::verify_refs(
 				tx,
@@ -71,16 +116,23 @@ fn inventory_real_paths_win_across_ingestion_batches() {
 				&[SourceRef { path: RepoPath::new("bad%FF.rs").unwrap(), symbol: None }],
 			)
 		})?;
-		// Once evidence refers to an exclusion, replacing its display alias
-		// would silently change that evidence's target; fail closed instead.
+		// Referenced exclusions retain their IDs while a colliding literal
+		// path becomes independently referenceable.
 		let first=i::NewEntry{path:&invalid,blob_sha:Some("invalid-blob"),kind:i::EntryKind::Tracked,disposition:i::Disposition::Unresolved,reason:None,highlighted:false};
 		i::standalone::insert(conn,1,12,&[first],0)?;
+		let original_exclusion_id = i::list(conn, 12)?[0].inventory_entry_id;
 		conn.execute_batch("INSERT INTO review_units (review_unit_id,generation_id,client_review_unit_key,title,objective,source_refs,created_at) VALUES (31,12,'evidence','title','objective','[]',0);
             INSERT INTO review_unit_results (review_unit_id,commit_sha,profile_version,disposition,inspected_refs,result_payload,result_digest,corroborates_inventory_exclusion_id,created_at)
             SELECT 31,'next',1,'not_applicable','[]','{}',zeroblob(32),inventory_entry_id,0 FROM generation_inventory WHERE generation_id=12;")?;
 		let entry=i::NewEntry{path:&real,blob_sha:Some("real-blob"),kind:i::EntryKind::Tracked,disposition:i::Disposition::Mapped,reason:None,highlighted:true};
-		assert!(matches!(i::standalone::insert(conn,1,12,&[entry],1),Err(crate::Error::Conflict(crate::Conflict::InventoryPath))));
-		assert!(!i::list(conn,12)?[0].path.representable());
+		i::standalone::insert(conn,1,12,&[entry],1)?;
+		let rows = i::list(conn, 12)?;
+		assert_eq!(rows.len(), 2);
+		let exclusion = rows.iter().find(|row| row.inventory_entry_id == original_exclusion_id).unwrap();
+		assert!(!exclusion.path.representable());
+		assert_eq!(exclusion.blob_sha.as_deref(), Some("invalid-blob"));
+		assert_eq!(conn.query_row("SELECT corroborates_inventory_exclusion_id FROM review_unit_results WHERE review_unit_id=31", [], |row| row.get::<_, i64>(0))?, original_exclusion_id);
+		transaction::immediate(conn, |tx| i::verify_refs(tx, 12, &[SourceRef { path: RepoPath::new("bad%FF.rs").unwrap(), symbol: None }]))?;
 		Ok(())
 	})
 	.unwrap();
@@ -273,7 +325,7 @@ fn inventory_exclusions_are_visible_but_not_referenceable() {
 				.collect();
 			assert_eq!(
 				i::insert(tx, 1, 11, &entries, 0)?,
-				i::Inserted { inserted: 2, excluded: 1, skipped: 1 }
+				i::Inserted { inserted: 3, excluded: 2, skipped: 0 }
 			);
 			let rows = i::list(tx, 11)?;
 			assert!(rows

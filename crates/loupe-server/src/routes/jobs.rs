@@ -493,7 +493,9 @@ pub async fn submit_findings(
 fn storage_write_error(context: &str, error: loupe_storage::Error) -> (StatusCode, String) {
 	use loupe_storage::Error;
 	let status = match &error {
-		Error::Validation(_) | Error::UnknownPaths(_) => StatusCode::BAD_REQUEST,
+		Error::Validation(_) | Error::ReviewPayload(_) | Error::UnknownPaths(_) => {
+			StatusCode::BAD_REQUEST
+		},
 		Error::Conflict(_) => StatusCode::CONFLICT,
 		Error::Ownership(_) => StatusCode::FORBIDDEN,
 		Error::NotFound(_, _) => StatusCode::NOT_FOUND,
@@ -509,6 +511,13 @@ mod storage_error_tests {
 	fn domain_errors_keep_their_http_meaning() {
 		use loupe_storage::{Conflict, Entity, Error, Ownership};
 		for (error, status) in [
+			(
+				Error::ReviewPayload(loupe_core::review_payload::Error::Invalid {
+					field: "version",
+					rule: "unsupported version",
+				}),
+				StatusCode::BAD_REQUEST,
+			),
 			(Error::Conflict(Conflict::Checkpoint), StatusCode::CONFLICT),
 			(Error::Ownership(Ownership::LeadJob), StatusCode::FORBIDDEN),
 			(Error::NotFound(Entity::Job, 1), StatusCode::NOT_FOUND),

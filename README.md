@@ -350,10 +350,12 @@ For the coordinated HTTP protocol-3 rollout, follow the
 [protocol upgrade runbook](contrib/upgrading-protocol-v3.md). This foundation
 keeps review-phase claims disabled; it does not activate the v2 harness.
 
-For existing installations moving to schema v3, follow the
-[offline upgrade runbook](contrib/upgrading-schema-v3.md) before deploying the
-new server. Back up first and stop the old server and all workers; queued
-legacy work may remain, but leased jobs block the migration.
+For existing installations, follow the
+[schema-v4 offline upgrade runbook](contrib/upgrading-schema-v4.md) before
+deploying the new server. Back up first and stop the old server and all
+workers; queued legacy work may remain, but leased jobs block the migration.
+The [historical v3 runbook](contrib/upgrading-schema-v3.md) documents the
+intervening migration for older databases.
 
 ### 6. Register a repo and trigger a scan
 

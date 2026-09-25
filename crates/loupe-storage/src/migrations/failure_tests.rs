@@ -1,6 +1,6 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use super::fixtures::*;
+use super::fixtures::{apply_v3 as apply_pending, *};
 use super::v3::{run_with_probe, Step};
 use super::*;
 use crate::secrets::MasterKey;
@@ -149,7 +149,7 @@ fn v3_restoration_failure_rejects_bootstrap_but_keeps_complete_v3() {
 	assert_eq!(expected, schema(&fresh), "restoration failure must leave the entire v3 schema");
 	assert!(rows(&conn, "PRAGMA foreign_key_check").is_empty());
 	drop(conn);
-	let db = Db::open(&path, &MasterKey::for_tests()).unwrap();
+	let db = open_v3_db(&path);
 	db.with_conn(|conn| {
 		assert_eq!(schema(conn), expected);
 		assert_eq!(markers(conn), (3, 3));

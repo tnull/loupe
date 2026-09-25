@@ -251,7 +251,7 @@ fn retries_use_snapshot_limits_and_preserve_assignments() {
 		tx.execute("UPDATE review_campaigns SET effective_policy=?1 WHERE campaign_id=1", [snapshot.expose()])?;
 		tx.execute_batch("UPDATE jobs SET state='leased',attempts=4,hard_deadline_at=500,submit_by=400,soft_deadline_at=400,job_capability_hash=zeroblob(32) WHERE id=101;
 		INSERT INTO review_units (review_unit_id,generation_id,client_review_unit_key,title,objective,source_refs,created_at) VALUES (1,11,'u','t','o','[]',0);
-		INSERT INTO job_assigned_review_units VALUES (101,1,0,0);")?;
+		INSERT INTO job_assigned_review_units (job_id,review_unit_id,position,completed) VALUES (101,1,0,0);")?;
 		let error = BoundedText::<Reason>::new("execution failure")?;
 		assert_eq!(retry_or_fail(tx, 101, 100, &error)?, RetryOutcome::Requeued { eligible_at: 580 });
 		let job = jobs::get(tx, 101)?.unwrap();

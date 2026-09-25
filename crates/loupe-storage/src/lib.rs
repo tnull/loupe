@@ -27,10 +27,13 @@ pub mod review_units;
 pub mod scheduler;
 pub mod secrets;
 pub mod source_refs;
+pub mod terminal_payloads;
 pub mod terminal_receipt;
 pub mod transaction;
 pub mod workers;
 
+#[cfg(test)]
+mod evidence_tests;
 #[cfg(test)]
 mod proof_tests;
 #[cfg(test)]
@@ -39,6 +42,15 @@ mod replay_tests;
 mod review_tests;
 #[cfg(test)]
 mod scope_tests;
+
+/// Missing rows and historical rows without canonical evidence are distinct.
+/// A malformed modern payload is an error, never historical evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredEvidence<T> {
+	Missing,
+	Historical,
+	Recorded(T),
+}
 
 pub use db::{Db, Error, Result};
 pub use loupe_core::canonical;

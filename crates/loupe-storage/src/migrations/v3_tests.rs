@@ -1,7 +1,6 @@
-use super::fixtures::*;
+use super::fixtures::{apply_v3 as apply_pending, *};
 use super::*;
-use crate::secrets::MasterKey;
-use crate::{jobs, Db};
+use crate::jobs;
 
 #[test]
 fn v3_preserves_encrypted_legacy_data_and_claims() {
@@ -16,7 +15,7 @@ fn v3_preserves_encrypted_legacy_data_and_claims() {
 		.map(|table| rows(&conn, &format!("SELECT * FROM {table} ORDER BY id")))
 		.collect();
 	drop(conn);
-	let db = Db::open(&path, &MasterKey::for_tests()).unwrap();
+	let db = open_v3_db(&path);
 	assert_eq!(db.schema_version().unwrap(), 3, "B1 must install schema v3");
 	db.with_conn(|conn| {
 		assert_eq!(markers(conn), (3, 3));
@@ -83,7 +82,7 @@ fn v3_preserves_encrypted_legacy_data_and_claims() {
 	.unwrap();
 	drop(db);
 	// Leases only block the migration, not reopening an already upgraded DB.
-	let db = Db::open(&path, &MasterKey::for_tests()).unwrap();
+	let db = open_v3_db(&path);
 	assert_eq!(db.schema_version().unwrap(), 3);
 }
 

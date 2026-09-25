@@ -15,6 +15,8 @@ pub enum Error {
 	UnknownJobKinds(Vec<String>),
 	#[error(transparent)]
 	Validation(#[from] loupe_core::text::Error),
+	#[error(transparent)]
+	ReviewPayload(#[from] loupe_core::review_payload::Error),
 	#[error("conflict: {0:?}")]
 	Conflict(crate::Conflict),
 	#[error("ownership mismatch: {0:?}")]

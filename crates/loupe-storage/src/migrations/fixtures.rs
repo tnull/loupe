@@ -8,6 +8,19 @@ use rusqlite::{params, Connection};
 use super::{apply_migrations, Migration, V1_INITIAL, V2_JOB_CAPABILITIES};
 use crate::secrets::MasterKey;
 
+pub(super) fn apply_v3(conn: &mut Connection) -> rusqlite::Result<()> {
+	super::apply_migrations(conn, &super::MIGRATIONS[..3])
+}
+
+pub(super) fn open_v3_db(path: &Path) -> crate::Db {
+	crate::Db::bootstrap_with_migration(
+		Connection::open(path).unwrap(),
+		&MasterKey::for_tests(),
+		apply_v3,
+	)
+	.unwrap()
+}
+
 pub(super) const LEGACY_COLUMNS: &str = "id, repo_id, kind, state, incremental, since_sha,
     head_sha, parent_job_id, target_finding_id, worker_id, lease_expires_at, attempts,
     enqueued_at, started_at, finished_at, error, job_capability_hash";

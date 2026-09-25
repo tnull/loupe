@@ -8,6 +8,7 @@
 use rusqlite::{params, Connection};
 
 mod v3;
+mod v4;
 
 #[cfg(test)]
 mod framework_tests;
@@ -20,6 +21,12 @@ mod fixtures;
 mod ownership_tests;
 #[cfg(test)]
 mod v3_tests;
+#[cfg(test)]
+mod v4_failure_tests;
+#[cfg(test)]
+mod v4_ownership_tests;
+#[cfg(test)]
+mod v4_tests;
 
 /// One migration step. Versions are dense (1, 2, 3, ...) and applied in
 /// ascending order.
@@ -41,6 +48,7 @@ const MIGRATIONS: &[Migration] = &[
 	Migration::Sql { version: 1, sql: V1_INITIAL },
 	Migration::Sql { version: 2, sql: V2_JOB_CAPABILITIES },
 	Migration::Structural { version: 3, run: v3::run },
+	Migration::Structural { version: 4, run: v4::run },
 ];
 
 /// The highest version this build knows about.

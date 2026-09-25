@@ -1,13 +1,17 @@
 use rusqlite::{params, Connection};
 
-use super::apply_pending;
-use super::fixtures::*;
+use super::fixtures::{apply_v3 as apply_pending, *};
 
 fn two_projects() -> Connection {
 	let mut conn = Connection::open_in_memory().unwrap();
 	conn.pragma_update(None, "foreign_keys", true).unwrap();
 	settled(&mut conn);
 	apply_pending(&mut conn).unwrap();
+	populate_projects(&conn);
+	conn
+}
+
+pub(super) fn populate_projects(conn: &Connection) {
 	for repo in [1, 2] {
 		let id = repo + 10;
 		conn.execute("INSERT INTO review_generations
@@ -129,7 +133,6 @@ fn two_projects() -> Connection {
              pinned_commit_sha, effective_recipe, result_digest, created_at)
             VALUES (?1, ?1, 'drilldown', 'completed', 'copied title', 'commit', '{}', zeroblob(32), 100)", [id]).unwrap();
 	}
-	conn
 }
 
 fn rejects(conn: &Connection, sql: &str, code: i32) {
