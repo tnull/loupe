@@ -2,6 +2,7 @@ pub mod findings_admin;
 pub mod health;
 pub mod jobs;
 pub mod repos;
+pub mod review_compatibility;
 pub mod review_context;
 pub mod review_drilldown;
 pub mod review_evidence;

@@ -45,6 +45,9 @@ mod drilldown_terminal;
 #[path = "review_verification/mod.rs"]
 mod verification_terminal;
 
+#[path = "review_compatibility/mod.rs"]
+mod compatibility;
+
 struct Fixture {
 	state: AppState,
 	peer: PeerCert,

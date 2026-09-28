@@ -161,6 +161,130 @@ fn v4_generation_purge_preserves_canonical_evidence_and_verification_intent() {
 }
 
 #[test]
+fn operator_reset_preserves_canonical_history_and_blocks_unfinished_obligations() {
+	for state in ["active", "building"] {
+		let mut conn = prepared();
+		conn.execute("UPDATE review_generations SET state=?1,generated_profile='invalid JSON' WHERE generation_id=11", [state]).unwrap();
+		conn.execute(
+			"UPDATE review_units SET closure_criteria=?1 WHERE generation_id=11",
+			["x".repeat(3000)],
+		)
+		.unwrap();
+		let retained = [
+			"findings",
+			"finding_verifications",
+			"verification_attempt_details",
+			"verification_proofs",
+			"proof_artifact_blobs",
+			"proof_artifacts",
+			"proof_executions",
+			"verification_proof_artifacts",
+			"verification_proof_executions",
+			"job_checkpoints",
+			"job_terminal_receipts",
+			"job_terminal_payloads",
+			"campaign_admission_spending",
+			"job_admission_charges",
+		];
+		let before: Vec<_> = retained
+			.iter()
+			.map(|t| rows(&conn, &format!("SELECT * FROM {t} ORDER BY rowid")))
+			.collect();
+		let provenance = rows(&conn,"SELECT originating_job_id,originating_campaign_id,admission_campaign_id,source_commit_sha,profile_version,profile_digest,intent_revision,intent_kind,continuation_class,logical_sequence,admitted_job_id,accepted_band,accepted_score,priority_policy_version,created_at FROM finding_verification_intents WHERE finding_id=11");
+		let summary = crate::transaction::immediate(&mut conn, |tx| {
+			crate::review_compatibility::reset(tx, 11, 500)
+		})
+		.unwrap();
+		assert_eq!(summary.review_units_removed, 1);
+		assert_eq!(summary.leads_removed, 1);
+		assert_eq!(summary.verification_intents_blocked, 1);
+		for (table, expected) in retained.iter().zip(before) {
+			assert_eq!(
+				rows(&conn, &format!("SELECT * FROM {table} ORDER BY rowid")),
+				expected,
+				"{table}"
+			);
+		}
+		assert_eq!(rows(&conn,"SELECT originating_job_id,originating_campaign_id,admission_campaign_id,source_commit_sha,profile_version,profile_digest,intent_revision,intent_kind,continuation_class,logical_sequence,admitted_job_id,accepted_band,accepted_score,priority_policy_version,created_at FROM finding_verification_intents WHERE finding_id=11"),provenance);
+		assert_eq!(rows(&conn,"SELECT generation_id,state,block_reason FROM finding_verification_intents WHERE finding_id=11"),vec![vec![rusqlite::types::Value::Null,"blocked".to_string().into(),"requires_successor".to_string().into()]]);
+		assert_eq!(rows(&conn,"SELECT state,generated_profile,inventory_digest,pending_follow_up,coverage,retired_reason FROM review_generations WHERE generation_id=11"),vec![vec!["retired".to_string().into(),rusqlite::types::Value::Null,rusqlite::types::Value::Null,rusqlite::types::Value::Null,"unknown".to_string().into(),"operator compatibility reset".to_string().into()]]);
+		assert!(
+			!rows(&conn, "SELECT * FROM review_generations WHERE generation_id=12").is_empty(),
+			"other repository untouched"
+		);
+		assert_eq!(
+			rows(&conn, "SELECT generation_id,assigned_lead_id FROM jobs WHERE id=11"),
+			vec![vec![rusqlite::types::Value::Null, rusqlite::types::Value::Null]]
+		);
+		assert!(rows(&conn, "PRAGMA foreign_key_check").is_empty());
+	}
+}
+
+#[test]
+fn operator_reset_preserves_completed_and_typed_continuation_intent_identity() {
+	for state in ["complete", "pending", "blocked", "admitted"] {
+		let mut conn = prepared();
+		conn.execute("UPDATE finding_verification_intents SET state=?1,intent_kind='logical_continuation',logical_sequence=3,intent_revision=4,continuation_class='awaiting_proof_infrastructure',not_before=800,block_reason='awaiting_proof_infrastructure' WHERE finding_id=11",[state]).unwrap();
+		let before = rows(&conn, "SELECT * FROM finding_verification_intents WHERE finding_id=11");
+		let summary = crate::transaction::immediate(&mut conn, |tx| {
+			crate::review_compatibility::reset(tx, 11, 500)
+		})
+		.unwrap();
+		let mut expected = before;
+		expected[0][2] = rusqlite::types::Value::Null;
+		if state != "complete" {
+			expected[0][13] = "blocked".to_string().into();
+			expected[0][15] = "requires_successor".to_string().into();
+			expected[0][21] = 500.into();
+		}
+		assert_eq!(summary.verification_intents_blocked, u64::from(state != "complete"));
+		assert_eq!(
+			rows(&conn, "SELECT * FROM finding_verification_intents WHERE finding_id=11"),
+			expected
+		);
+	}
+}
+
+#[test]
+fn operator_reset_refuses_every_live_reference_and_competing_generation_atomically() {
+	for mutation in [
+		"UPDATE jobs SET state='queued' WHERE id=11",
+		"UPDATE jobs SET state='leased' WHERE id=11",
+		"INSERT INTO jobs(id,repo_id,kind,state,enqueued_at) VALUES(31,1,'survey','queued',0); INSERT INTO job_assigned_review_units(job_id,review_unit_id,position) VALUES(31,11,0)",
+		"UPDATE jobs SET state='leased',generation_id=NULL WHERE id=21",
+		"UPDATE review_campaigns SET state='active' WHERE campaign_id=11",
+		"UPDATE review_campaigns SET state='active',generation_id=NULL WHERE campaign_id=11",
+		"INSERT INTO review_generations(generation_id,repo_id,generation_commit_sha,state,workflow_contract_version,created_at) VALUES(30,1,'next','building',1,1)",
+		"UPDATE review_generations SET state='retired' WHERE generation_id=11",
+	] {
+		let mut conn=prepared();
+		conn.execute_batch(mutation).unwrap_or_else(|error|panic!("fixture {mutation}: {error}"));
+		let before=super::v4_tests::Snapshot::take(&conn);
+		assert!(crate::transaction::immediate(&mut conn,|tx|crate::review_compatibility::reset(tx,11,500)).is_err(),"{mutation}");
+		before.assert_unchanged(&conn);
+	}
+}
+
+#[test]
+fn operator_reset_rolls_back_retirement_intent_blocking_and_purge_on_sql_failure() {
+	for (table, verb) in [
+		("review_generations", "UPDATE"),
+		("finding_verification_intents", "UPDATE"),
+		("review_units", "DELETE"),
+		("review_generations", "INSERT"),
+	] {
+		let mut conn = prepared();
+		conn.execute_batch(&format!("CREATE TRIGGER reject_reset BEFORE {verb} ON {table} BEGIN SELECT RAISE(ABORT,'reset fault'); END;")).unwrap();
+		let before = super::v4_tests::Snapshot::take(&conn);
+		assert!(crate::transaction::immediate(&mut conn, |tx| crate::review_compatibility::reset(
+			tx, 11, 500
+		))
+		.is_err());
+		before.assert_unchanged(&conn);
+	}
+}
+
+#[test]
 fn v4_job_deletion_never_refunds_spending_or_reopens_intents() {
 	let conn = prepared();
 	conn.execute("UPDATE generation_manifests SET owner_job_id = 21 WHERE generation_id = 11", [])

@@ -31,6 +31,7 @@ pub mod proofs;
 pub mod repos;
 mod review;
 pub mod review_authority;
+pub mod review_compatibility;
 pub mod review_findings;
 pub mod review_intents;
 pub mod review_unit_results;

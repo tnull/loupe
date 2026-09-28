@@ -46,6 +46,7 @@ pub fn router(state: AppState) -> Router {
 		.route("/v1/jobs/{id}", get(routes::jobs::get))
 		.route("/v1/jobs/{id}/retry", post(routes::jobs::retry))
 		.route("/v1/jobs/{id}/cancel", post(routes::review_lifecycle::cancel))
+		.route("/v1/review-generations/{id}/reset", post(routes::review_compatibility::reset))
 		.route_layer(axum::middleware::from_fn(auth::require_admin));
 
 	let worker_only = Router::new()
