@@ -7,6 +7,7 @@
 //! run.
 
 pub mod admission;
+pub mod admission_candidates;
 pub mod admission_policy;
 pub mod campaigns;
 pub mod checkpoints;
