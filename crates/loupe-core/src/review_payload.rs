@@ -452,3 +452,6 @@ canonical_payload!(PromotionV1, "promotion", EVIDENCE_MAX_BYTES);
 canonical_payload!(SurveyTerminalV1, "survey_terminal", SURVEY_TERMINAL_MAX_BYTES);
 canonical_payload!(DrilldownTerminalV1, "drilldown_terminal", EVIDENCE_MAX_BYTES);
 canonical_payload!(VerificationTerminalV1, "verification_terminal", EVIDENCE_MAX_BYTES);
+
+mod checkpoint;
+pub use checkpoint::*;

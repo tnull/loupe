@@ -43,6 +43,7 @@ pub enum Conflict {
 	Corroboration,
 	LeadState,
 	Checkpoint,
+	CheckpointEvidence,
 	CheckpointLimit,
 	Candidate,
 	TerminalReceipt,
@@ -112,6 +113,63 @@ where
 			})
 		})
 		.transpose()
+}
+
+/// The namespaced format is reserved for strict checkpoint evidence. Decode
+/// only the marker here; the typed parser remains responsible for all fields.
+pub(crate) fn is_checkpoint_evidence(raw: &str) -> crate::Result<bool> {
+	let value: serde_json::Value =
+		serde_json::from_str(raw).map_err(loupe_core::review_payload::Error::from)?;
+	if !value.is_object() {
+		return Ok(false);
+	}
+	#[derive(serde::Deserialize)]
+	struct Marker {
+		format: Option<serde_json::Value>,
+	}
+	let marker: Marker =
+		serde_json::from_str(raw).map_err(loupe_core::review_payload::Error::from)?;
+	Ok(marker
+		.format
+		.as_ref()
+		.and_then(serde_json::Value::as_str)
+		.is_some_and(|format| format.starts_with("loupe.")))
+}
+
+pub(crate) fn historical_payload(
+	row: &Row<'_>, index: usize,
+) -> rusqlite::Result<loupe_core::text::BoundedJson<loupe_core::text::policy::Payload>> {
+	let raw: String = row.get(index)?;
+	let read = || -> crate::Result<_> {
+		require_historical_payload(&raw)?;
+		Ok(loupe_core::text::BoundedJson::new(&raw)?)
+	};
+	read().map_err(|error| {
+		rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
+	})
+}
+
+pub(crate) fn require_historical_payload(raw: &str) -> crate::Result<()> {
+	if is_checkpoint_evidence(raw)? {
+		return Err(crate::Error::Conflict(Conflict::CheckpointEvidence));
+	}
+	Ok(())
+}
+
+pub(crate) fn checkpoint_evidence<T>(
+	raw: &str, digest: &[u8],
+	parse: impl FnOnce(&str) -> Result<T, loupe_core::review_payload::Error>,
+	canonical: impl FnOnce(&T) -> Result<Vec<u8>, loupe_core::review_payload::Error>,
+) -> crate::Result<crate::StoredEvidence<T>> {
+	if !is_checkpoint_evidence(raw)? {
+		return Ok(crate::StoredEvidence::Historical);
+	}
+	let payload = parse(raw)?;
+	if canonical(&payload)? != raw.as_bytes() || digest != crate::canonical::digest(raw.as_bytes())
+	{
+		return Err(crate::Error::Conflict(Conflict::CheckpointEvidence));
+	}
+	Ok(crate::StoredEvidence::Recorded(payload))
 }
 
 /// A duplicate on a UNIQUE index or on a rowid-alias primary key; SQLite

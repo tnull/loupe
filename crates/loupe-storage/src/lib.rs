@@ -38,6 +38,10 @@ pub mod transaction;
 pub mod workers;
 
 #[cfg(test)]
+mod checkpoint_evidence_feature_tests;
+#[cfg(test)]
+mod checkpoint_evidence_tests;
+#[cfg(test)]
 mod evidence_tests;
 #[cfg(test)]
 mod proof_tests;

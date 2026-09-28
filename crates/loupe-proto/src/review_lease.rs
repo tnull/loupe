@@ -251,6 +251,8 @@ pub struct AssignedReviewLead {
 	pub identity_anchor: Anchor<AnchorText>,
 	pub identity_instance_key: Option<Anchor<InstanceKey>>,
 	pub hypothesis: BoundedText<Argument>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub invariant_or_boundary: Option<BoundedText<Reason>>,
 	pub source_refs: LeaseList<SourceRef, 16, 1>,
 	pub next_proof_step: BoundedText<Reason>,
 	pub counterevidence: BoundedText<Objective>,
@@ -295,6 +297,34 @@ mod tests {
 
 	use super::*;
 	use crate::{LeasePayload, LeaseRequest, PROTOCOL_VERSION};
+
+	#[test]
+	fn assigned_lead_retains_optional_invariant_and_exact_paths() {
+		let raw = serde_json::json!({
+			"lead_id":1,"producer_commit_sha":"a".repeat(40),
+			"identity_family":"auth-bypass","identity_anchor":"request guard",
+			"hypothesis":"wrapper bypass","invariant_or_boundary":"authentication boundary",
+			"source_refs":[{"path":"cafe\u{301}.rs"}],"next_proof_step":"trace wrapper",
+			"counterevidence":"guard exists","proof_gaps":"entry is uncertain"
+		});
+		let lead: AssignedReviewLead = serde_json::from_value(raw.clone()).unwrap();
+		assert_eq!(
+			lead.invariant_or_boundary.as_ref().unwrap().expose(),
+			"authentication boundary"
+		);
+		assert_eq!(lead.source_refs.as_slice()[0].path.expose(), "cafe\u{301}.rs");
+		assert_eq!(
+			serde_json::from_str::<AssignedReviewLead>(&serde_json::to_string(&lead).unwrap())
+				.unwrap(),
+			lead
+		);
+		let mut without = raw;
+		without.as_object_mut().unwrap().remove("invariant_or_boundary");
+		assert!(serde_json::from_value::<AssignedReviewLead>(without)
+			.unwrap()
+			.invariant_or_boundary
+			.is_none());
+	}
 
 	fn provenance() -> Value {
 		json!({"workflow_contract_version":1,"campaign_id":2,"attempt":1,

@@ -1,12 +1,18 @@
 //! Semantic identity attachment never discards a submitted observation.
+use loupe_core::review_payload::LeadEvidenceV1;
 use loupe_core::text::policy::{Payload, Reason};
 use loupe_core::text::{BoundedJson, BoundedText};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 
 use crate::identity::Identity;
-use crate::review::{changed, is_unique, optional, parsed, standalone, string_enum};
+use crate::review::{
+	changed, historical_payload, is_unique, optional, parsed, standalone, string_enum,
+};
 use crate::review_units::Priority;
-use crate::{lead_observations, ownership, Conflict, Entity, Error, Ownership, Result};
+use crate::{
+	inventory, lead_observations, ownership, Conflict, Entity, Error, Ownership, Result,
+	StoredEvidence,
+};
 string_enum!(Status { Open=>"open", Deferred=>"deferred", Closed=>"closed" });
 string_enum!(Disposition { Promoted=>"promoted", Rejected=>"rejected", Duplicate=>"duplicate", Hardening=>"hardening", Stale=>"stale" });
 pub struct NewLead<'a> {
@@ -19,6 +25,31 @@ pub struct NewLead<'a> {
 	pub priority_proposal: Option<&'a BoundedJson<Payload>>,
 	pub supersedes: Option<i64>,
 	pub created_by_job: Option<i64>,
+}
+/// Producer facts are server-owned; every semantic projection is derived from
+/// `payload`. Lease authority, assignment epochs and admission belong to callers.
+pub struct NewLeadEvidence<'a> {
+	pub generation_id: i64,
+	pub created_by_job: i64,
+	pub commit_sha: &'a str,
+	pub priority: Priority,
+	pub payload: &'a LeadEvidenceV1,
+}
+/// Identity, scope, state and provenance without reading either evidence format.
+#[derive(Debug, Clone)]
+pub struct Metadata {
+	pub lead_id: i64,
+	pub generation_id: i64,
+	pub unit_id: Option<i64>,
+	pub identity: Identity,
+	pub status: Status,
+	pub disposition: Option<Disposition>,
+	pub priority: Priority,
+	pub commit_sha: String,
+	pub needs_revalidation: bool,
+	pub promoted_finding: Option<i64>,
+	pub created_by_job: Option<i64>,
+	pub created_at: i64,
 }
 #[derive(Debug, Clone)]
 pub struct Lead {
@@ -58,6 +89,85 @@ pub enum Closure {
 	Stale,
 }
 pub fn submit(tx: &Transaction<'_>, new: &NewLead<'_>, now: i64) -> Result<Submitted> {
+	crate::review::require_historical_payload(new.payload.expose())?;
+	submit_inner(
+		tx,
+		&LeadInput {
+			generation_id: new.generation_id,
+			unit_id: new.unit_id,
+			identity: new.identity,
+			payload: new.payload.expose(),
+			digest: *new.payload.digest(),
+			commit_sha: new.commit_sha,
+			priority: new.priority,
+			priority_proposal: new.priority_proposal.map(BoundedJson::expose),
+			supersedes: new.supersedes,
+			created_by_job: new.created_by_job,
+		},
+		now,
+	)
+}
+
+pub fn submit_evidence(
+	tx: &Transaction<'_>, new: &NewLeadEvidence<'_>, now: i64,
+) -> Result<Submitted> {
+	let bytes = new.payload.canonical_bytes()?;
+	validate_evidence_scope(tx, new.generation_id, new.payload)?;
+	let identity = evidence_identity(new.payload);
+	submit_inner(
+		tx,
+		&LeadInput {
+			generation_id: new.generation_id,
+			unit_id: new.payload.review_unit_id,
+			identity: &identity,
+			payload: std::str::from_utf8(&bytes).expect("canonical JSON is UTF-8"),
+			digest: crate::canonical::digest(&bytes),
+			commit_sha: new.commit_sha,
+			priority: new.priority,
+			priority_proposal: None,
+			supersedes: None,
+			created_by_job: Some(new.created_by_job),
+		},
+		now,
+	)
+}
+
+pub(crate) fn evidence_identity(payload: &LeadEvidenceV1) -> Identity {
+	Identity {
+		family: payload.identity_family.clone(),
+		anchor: payload.identity_anchor.clone(),
+		instance: payload.identity_instance_key.clone(),
+	}
+}
+pub(crate) fn validate_evidence_scope(
+	tx: &Transaction<'_>, generation: i64, payload: &LeadEvidenceV1,
+) -> Result<()> {
+	let repo = ownership::generation_repo(tx, generation)?;
+	if let Some(unit) = payload.review_unit_id {
+		ownership::unit_in_generation(tx, unit, generation, Ownership::LeadUnit)?;
+	}
+	inventory::verify_refs(tx, generation, &payload.source_refs)?;
+	if let Some(proposal) = &payload.priority_proposal {
+		inventory::verify_refs(tx, generation, &proposal.boundary_refs)?;
+	}
+	if let Some(hint) = &payload.duplicate_hint {
+		ownership::lead_in_repo(tx, hint.lead_id, repo, Ownership::DuplicateLead)?;
+	}
+	Ok(())
+}
+struct LeadInput<'a> {
+	generation_id: i64,
+	unit_id: Option<i64>,
+	identity: &'a Identity,
+	payload: &'a str,
+	digest: [u8; 32],
+	commit_sha: &'a str,
+	priority: Priority,
+	priority_proposal: Option<&'a str>,
+	supersedes: Option<i64>,
+	created_by_job: Option<i64>,
+}
+fn submit_inner(tx: &Transaction<'_>, new: &LeadInput<'_>, now: i64) -> Result<Submitted> {
 	ownership::generation_repo(tx, new.generation_id)?;
 	if let Some(unit) = new.unit_id {
 		ownership::unit_in_generation(tx, unit, new.generation_id, Ownership::LeadUnit)?;
@@ -84,19 +194,18 @@ pub fn submit(tx: &Transaction<'_>, new: &NewLead<'_>, now: i64) -> Result<Submi
   None=>tx.query_row("SELECT lead_id FROM leads WHERE generation_id=?1 AND identity_fingerprint=?2 AND status='closed' AND disposition='stale' ORDER BY lead_id DESC LIMIT 1",params![new.generation_id,fingerprint.as_slice()],|r|r.get(0)).optional()?
  };
 	let result=tx.execute("INSERT INTO leads (generation_id,review_unit_id,priority_band,priority_proposal,identity_family,identity_anchor,identity_instance_key,identity_fingerprint,anchored_payload,anchored_digest,commit_sha,supersedes_lead_id,created_by_job_id,created_at)
- VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![new.generation_id,new.unit_id,new.priority.as_str(),new.priority_proposal.map(BoundedJson::expose),new.identity.family.expose(),new.identity.anchor.expose(),new.identity.instance.as_ref().map(|v|v.expose()),fingerprint.as_slice(),new.payload.expose(),new.payload.digest().as_slice(),new.commit_sha,supersedes,new.created_by_job,now]);
+ VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![new.generation_id,new.unit_id,new.priority.as_str(),new.priority_proposal,new.identity.family.expose(),new.identity.anchor.expose(),new.identity.instance.as_ref().map(|v|v.expose()),fingerprint.as_slice(),new.payload,new.digest.as_slice(),new.commit_sha,supersedes,new.created_by_job,now]);
 	match result {
 		Ok(_) => Ok(Submitted::Created(tx.last_insert_rowid())),
 		Err(error) if is_unique(&error, "leads.generation_id, leads.identity_fingerprint") => {
-			let existing=tx.query_row(&format!("SELECT {COLUMNS} FROM leads WHERE generation_id=?1 AND identity_fingerprint=?2 AND (status<>'closed' OR disposition<>'stale')"),params![new.generation_id,fingerprint.as_slice()],row)?;
-			lead_observations::insert(
+			let existing=tx.query_row(&format!("SELECT {METADATA_COLUMNS} FROM leads WHERE generation_id=?1 AND identity_fingerprint=?2 AND (status<>'closed' OR disposition<>'stale')"),params![new.generation_id,fingerprint.as_slice()],metadata_row)?;
+			lead_observations::insert_raw(
 				tx,
-				&lead_observations::NewObservation {
-					lead_id: existing.lead_id,
-					submitted_by_job: new.created_by_job,
-					payload: new.payload,
-					commit_sha: new.commit_sha,
-				},
+				existing.lead_id,
+				new.created_by_job,
+				new.payload,
+				&new.digest,
+				new.commit_sha,
 				now,
 			)?;
 			match existing.status {
@@ -138,7 +247,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Lead> {
 			anchor: parsed(r, 10)?,
 			instance: optional(r, 11)?,
 		},
-		payload: parsed(r, 12)?,
+		payload: historical_payload(r, 12)?,
 		commit_sha: r.get(13)?,
 		needs_revalidation: r.get(14)?,
 		carry_depth: r.get(15)?,
@@ -163,7 +272,7 @@ pub fn list(conn: &Connection, generation: i64) -> Result<Vec<Lead>> {
 		.collect::<rusqlite::Result<_>>()?)
 }
 pub fn close(tx: &Transaction<'_>, id: i64, closure: &Closure, now: i64) -> Result<()> {
-	let lead = get(tx, id)?.ok_or(Error::NotFound(Entity::Lead, id))?;
+	let lead = get_metadata(tx, id)?.ok_or(Error::NotFound(Entity::Lead, id))?;
 	let repo = ownership::generation_repo(tx, lead.generation_id)?;
 	let (disposition, duplicate_lead, duplicate_finding, promoted_finding) = match closure {
 		Closure::Promoted { finding } => {
@@ -200,6 +309,61 @@ pub fn reopen(tx: &Transaction<'_>, id: i64) -> Result<()> {
 pub fn mark_needs_revalidation(tx: &Transaction<'_>, id: i64) -> Result<()> {
 	changed(tx.execute("UPDATE leads SET needs_revalidation=1 WHERE lead_id=?1 AND status IN ('open','deferred')",[id])?,Conflict::LeadState)
 }
-standalone! {submit(new:&NewLead<'_>,now:i64)->Submitted;close(id:i64,closure:&Closure,now:i64)->();
+standalone! {submit(new:&NewLead<'_>,now:i64)->Submitted;submit_evidence(new:&NewLeadEvidence<'_>,now:i64)->Submitted;close(id:i64,closure:&Closure,now:i64)->();
 defer(id:i64,reason:&BoundedText<Reason>,retry:Option<&BoundedText<Reason>>)->();
 reopen(id:i64)->();mark_needs_revalidation(id:i64)->();}
+
+const METADATA_COLUMNS: &str = "lead_id,generation_id,review_unit_id,identity_family,identity_anchor,identity_instance_key,status,disposition,priority_band,commit_sha,needs_revalidation,promoted_finding_id,created_by_job_id,created_at";
+fn metadata_row(row: &Row<'_>) -> rusqlite::Result<Metadata> {
+	Ok(Metadata {
+		lead_id: row.get(0)?,
+		generation_id: row.get(1)?,
+		unit_id: row.get(2)?,
+		identity: Identity {
+			family: parsed(row, 3)?,
+			anchor: parsed(row, 4)?,
+			instance: optional(row, 5)?,
+		},
+		status: parsed(row, 6)?,
+		disposition: optional(row, 7)?,
+		priority: parsed(row, 8)?,
+		commit_sha: row.get(9)?,
+		needs_revalidation: row.get(10)?,
+		promoted_finding: row.get(11)?,
+		created_by_job: row.get(12)?,
+		created_at: row.get(13)?,
+	})
+}
+pub fn get_metadata(conn: &Connection, id: i64) -> Result<Option<Metadata>> {
+	Ok(conn
+		.query_row(
+			&format!("SELECT {METADATA_COLUMNS} FROM leads WHERE lead_id=?1"),
+			[id],
+			metadata_row,
+		)
+		.optional()?)
+}
+
+pub fn get_evidence(conn: &Connection, id: i64) -> Result<StoredEvidence<LeadEvidenceV1>> {
+	let row = conn.query_row("SELECT anchored_payload,anchored_digest,review_unit_id,identity_family,identity_anchor,identity_instance_key,identity_fingerprint,priority_proposal FROM leads WHERE lead_id=?1",[id],|row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,Option<i64>>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,Vec<u8>>(6)?,row.get::<_,Option<String>>(7)?))).optional()?;
+	let Some((raw, digest, unit, family, anchor, instance, fingerprint, proposal)) = row else {
+		return Ok(StoredEvidence::Missing);
+	};
+	let evidence = crate::review::checkpoint_evidence(
+		&raw,
+		&digest,
+		LeadEvidenceV1::from_json,
+		LeadEvidenceV1::canonical_bytes,
+	)?;
+	if let StoredEvidence::Recorded(payload) = &evidence
+		&& (unit != payload.review_unit_id
+			|| family != payload.identity_family.expose()
+			|| anchor != payload.identity_anchor.expose()
+			|| instance.as_deref() != payload.identity_instance_key.as_ref().map(|v| v.expose())
+			|| fingerprint != evidence_identity(payload).fingerprint()
+			|| proposal.is_some())
+	{
+		return Err(Error::Conflict(Conflict::CheckpointEvidence));
+	}
+	Ok(evidence)
+}

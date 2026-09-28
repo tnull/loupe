@@ -1,0 +1,181 @@
+use serde_json::{json, Value};
+
+use super::*;
+
+fn lead() -> Value {
+	json!({
+		"format":"loupe.lead_evidence", "version":1,
+		"identity_family":"auth-bypass", "identity_anchor":"token boundary",
+		"review_unit_id":31, "assignment_epoch":0,
+		"hypothesis":"untrusted token reaches a privileged sink",
+		"invariant_or_boundary":"authentication boundary",
+		"source_refs":[{"path":"cafe\u{301}.rs"}],
+		"next_proof_step":"trace the wrapper", "counterevidence":"wrapper checks exist",
+		"proof_gaps":"attacker control is not traced",
+		"priority_proposal":{"impact":"high","access":"remote","reachability":"traced",
+			"boundary_refs":[{"path":"cafe\u{301}.rs"}],"rationale":"reachable boundary"},
+		"duplicate_hint":{"lead_id":9,"rationale":"same boundary"}
+	})
+}
+fn result() -> Value {
+	json!({
+		"format":"loupe.unit_result", "version":1,"review_unit_id":31,"assignment_epoch":0,
+		"disposition":"no_lead_found","inspected_refs":[{"path":"cafe\u{301}.rs"}],
+		"created_lead_ids":[],"counterevidence":"checked the guard","proof_gaps":"no gaps"
+	})
+}
+
+#[test]
+fn checkpoint_payload_paths_remain_exact_and_digests_distinguish_them() {
+	let lead = LeadEvidenceV1::from_json(&lead().to_string()).unwrap();
+	let raw = String::from_utf8(lead.canonical_bytes().unwrap()).unwrap();
+	assert_eq!(LeadEvidenceV1::from_json(&raw).unwrap(), lead);
+	assert_eq!(lead.source_refs[0].path.expose(), "cafe\u{301}.rs");
+	assert_eq!(
+		lead.priority_proposal.as_ref().unwrap().boundary_refs[0].path.expose(),
+		"cafe\u{301}.rs"
+	);
+	let normalized = LeadEvidenceV1::from_json(&raw.replace("cafe\u{301}.rs", "café.rs")).unwrap();
+	assert_ne!(lead.digest().unwrap(), normalized.digest().unwrap());
+	let result = UnitResultPayloadV1::from_json(&result().to_string()).unwrap();
+	assert_eq!(result.inspected_refs[0].path.expose(), "cafe\u{301}.rs");
+	assert_eq!(
+		UnitResultPayloadV1::from_json(
+			&String::from_utf8(result.canonical_bytes().unwrap()).unwrap()
+		)
+		.unwrap(),
+		result
+	);
+}
+
+#[test]
+fn checkpoint_payloads_reject_unknown_duplicate_fields_and_future_versions() {
+	{
+		let baseline = lead();
+		let parse = LeadEvidenceV1::from_json;
+		let mut value = baseline.clone();
+		value["unexpected"] = json!(true);
+		assert!(parse(&value.to_string()).is_err());
+		value = baseline.clone();
+		value["version"] = json!(2);
+		assert!(parse(&value.to_string()).is_err());
+		value = baseline.clone();
+		value["priority_proposal"]["unexpected"] = json!(true);
+		assert!(parse(&value.to_string()).is_err());
+		let raw = baseline.to_string();
+		assert!(parse(&format!("{{\"version\":1,{}", &raw[1..])).is_err());
+	}
+	let mut value = result();
+	value["unexpected"] = json!(true);
+	assert!(UnitResultPayloadV1::from_json(&value.to_string()).is_err());
+	value = result();
+	value["version"] = json!(2);
+	assert!(UnitResultPayloadV1::from_json(&value.to_string()).is_err());
+	let raw = result().to_string();
+	assert!(UnitResultPayloadV1::from_json(&format!("{{\"version\":1,{}", &raw[1..])).is_err());
+}
+
+#[test]
+fn lead_checkpoint_bounds_validate_both_deserialization_and_serialization() {
+	for (field, bad) in [
+		("review_unit_id", json!(0)),
+		("assignment_epoch", json!(-1)),
+		("source_refs", json!([])),
+		("source_refs", json!(vec![json!({"path":"a.rs"}); 17])),
+		("duplicate_hint", json!({"lead_id":0,"rationale":"same"})),
+	] {
+		let mut value = lead();
+		value[field] = bad;
+		assert!(LeadEvidenceV1::from_json(&value.to_string()).is_err(), "{field}");
+	}
+	for field in ["review_unit_id", "assignment_epoch"] {
+		let mut value = lead();
+		value.as_object_mut().unwrap().remove(field);
+		assert!(LeadEvidenceV1::from_json(&value.to_string()).is_err(), "paired {field}");
+	}
+	let mut value = lead();
+	value["priority_proposal"]["boundary_refs"] = json!(vec![json!({"path":"a.rs"}); 17]);
+	assert!(LeadEvidenceV1::from_json(&value.to_string()).is_err());
+	let mut typed = LeadEvidenceV1::from_json(&lead().to_string()).unwrap();
+	typed.source_refs.clear();
+	assert!(serde_json::to_string(&typed).is_err());
+	assert!(typed.canonical_bytes().is_err());
+}
+
+#[test]
+fn unit_result_disposition_rules_are_bidirectional() {
+	for disposition in ["no_lead_found", "not_applicable", "lead_created", "needs_follow_up"] {
+		let mut value = result();
+		value["disposition"] = json!(disposition);
+		match disposition {
+			"lead_created" => value["created_lead_ids"] = json!([1, 2]),
+			"needs_follow_up" => {
+				value["follow_up"] = json!("trace next");
+				value["continuation"] = json!("source_analysis_remaining");
+			},
+			_ => {},
+		}
+		let parsed = UnitResultPayloadV1::from_json(&value.to_string()).unwrap();
+		assert!(serde_json::to_string(&parsed).is_ok());
+		if disposition == "lead_created" {
+			value["created_lead_ids"] = json!([]);
+		} else {
+			value["created_lead_ids"] = json!([1]);
+		}
+		assert!(UnitResultPayloadV1::from_json(&value.to_string()).is_err());
+	}
+	for (field, bad) in [
+		("review_unit_id", json!(0)),
+		("assignment_epoch", json!(-1)),
+		("inspected_refs", json!([])),
+		("inspected_refs", json!(vec![json!({"path":"a.rs"}); 65])),
+		("follow_up", json!("later")),
+		("continuation", json!("requires_successor")),
+	] {
+		let mut value = result();
+		value[field] = bad;
+		assert!(UnitResultPayloadV1::from_json(&value.to_string()).is_err(), "{field}");
+	}
+	for ids in [json!([1, 1]), json!([0]), json!((1..=17).collect::<Vec<_>>())] {
+		let mut value = result();
+		value["disposition"] = json!("lead_created");
+		value["created_lead_ids"] = ids;
+		assert!(UnitResultPayloadV1::from_json(&value.to_string()).is_err());
+	}
+	for omitted in ["follow_up", "continuation"] {
+		let mut value = result();
+		value["disposition"] = json!("needs_follow_up");
+		value["follow_up"] = json!("trace next");
+		value["continuation"] = json!("source_analysis_remaining");
+		value.as_object_mut().unwrap().remove(omitted);
+		assert!(UnitResultPayloadV1::from_json(&value.to_string()).is_err());
+	}
+}
+
+#[test]
+fn checkpoint_payloads_enforce_aggregate_budget() {
+	let reference = SourceRef {
+		path: RepoPath::new(&"\"".repeat(512)).unwrap(),
+		symbol: Some(BoundedText::new(&"\"".repeat(256)).unwrap()),
+	};
+	let mut result = UnitResultPayloadV1::from_json(&result().to_string()).unwrap();
+	result.inspected_refs = vec![reference.clone(); 64];
+	assert!(matches!(result.canonical_bytes(), Err(Error::Bytes { max_bytes: 65536, .. })));
+	assert!(serde_json::to_string(&result).is_err());
+	result.inspected_refs.truncate(32);
+	assert!(
+		result.canonical_bytes().is_ok(),
+		"same individually valid fields fit below the aggregate cap"
+	);
+	let mut lead = LeadEvidenceV1::from_json(&lead().to_string()).unwrap();
+	lead.source_refs = vec![reference.clone(); 16];
+	lead.priority_proposal.as_mut().unwrap().boundary_refs = vec![reference; 16];
+	lead.hypothesis = BoundedText::new(&"\"".repeat(4000)).unwrap();
+	lead.counterevidence = BoundedText::new(&"\"".repeat(2000)).unwrap();
+	lead.proof_gaps = BoundedText::new(&"\"".repeat(2000)).unwrap();
+	lead.next_proof_step = BoundedText::new(&"\"".repeat(1000)).unwrap();
+	assert!(matches!(lead.canonical_bytes(), Err(Error::Bytes { max_bytes: 65536, .. })));
+	assert!(serde_json::to_string(&lead).is_err());
+	lead.source_refs.truncate(1);
+	assert!(lead.canonical_bytes().is_ok());
+}
