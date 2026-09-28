@@ -1,5 +1,5 @@
 //! Server orchestration with explicit worker-state fixtures. Storage tests
-//! exercise actual bootstrap/coverage/incremental claims without a reverse dependency.
+//! exercise claims without a reverse dependency; review_public covers the HTTP lifecycle.
 use loupe_core::text::policy::Payload;
 use loupe_core::text::BoundedJson;
 use loupe_core::{JobKind, JobState};
@@ -14,8 +14,8 @@ use rusqlite::{params, Transaction};
 // Pinning only accepts complete object ids.
 const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-// B3 intentionally cannot lease phase jobs through the public runtime path.
-// Once B4 enables it, the combined lifecycle test should use that path.
+// This orchestration fixture sets only the worker state needed by the test.
+// Public lease capabilities and terminal envelopes are covered in review_public.
 fn lease_fixture(
 	tx: &Transaction<'_>, job_id: i64, worker: i64,
 ) -> loupe_storage::Result<jobs::JobRow> {
@@ -59,11 +59,14 @@ fn bootstrap_to_coverage_preserves_the_profile_and_activation() {
 			loupe_storage::unit_holds::release_conclusive(tx,unit,result,job,epoch,3)
 		};
 		for unit in [1,2] {record(unit,job_id)?;}
-		assert_eq!(campaign::replenish(tx,campaign_id,3).unwrap(),None);
-		// B5's finalize supplies the terminal transition and checkpoint envelope.
+		assert_eq!(tx.query_row("SELECT COUNT(*) FROM jobs WHERE campaign_id=?1",[campaign_id],|r|r.get::<_,i64>(0))?,1);
+		assert_eq!(loupe_storage::admission::get_spending(tx,campaign_id)?.unwrap().total()?,1);
+		// Stand in for the terminal transition; public finalize is tested separately.
 		tx.execute("UPDATE jobs SET state='succeeded',finished_at=3 WHERE id=?1",[job_id])?;
 		campaign::activate_generation(tx,campaign_id,3).unwrap();
-		assert_eq!(campaign::replenish(tx,campaign_id,3)?,None);
+		assert_eq!(campaign::try_finish(tx,campaign_id,3)?,None);
+		assert_eq!(tx.query_row("SELECT COUNT(*) FROM jobs WHERE campaign_id=?1",[campaign_id],|r|r.get::<_,i64>(0))?,1);
+		assert_eq!(loupe_storage::admission::get_spending(tx,campaign_id)?.unwrap().total()?,1);
 		let policy=ReviewPolicy::default().claim_policy();
 		let req=admission_candidates::Request{worker_id:worker,legacy_kinds:&[],phase_kinds:&[JobKind::Survey],now:3,policy:&policy,limit:1};
 		let candidates=admission_candidates::ranked(tx,&req)?;
@@ -72,6 +75,8 @@ fn bootstrap_to_coverage_preserves_the_profile_and_activation() {
 		assert_eq!(claimed.assigned_units,vec![3,6,4,5]);
 		let batch=claimed.job;
 		let coverage=batch.id;
+		assert_eq!(tx.query_row("SELECT COUNT(*) FROM jobs WHERE campaign_id=?1",[campaign_id],|r|r.get::<_,i64>(0))?,2);
+		assert_eq!(loupe_storage::admission::get_spending(tx,campaign_id)?.unwrap().total()?,2);
 		tx.execute("UPDATE jobs SET head_sha=?2 WHERE id=?1",params![coverage,SHA])?;
 		assert_eq!(batch.kind,JobKind::Survey);
 		assert_eq!(batch.generation_id,Some(generation));
@@ -81,12 +86,13 @@ fn bootstrap_to_coverage_preserves_the_profile_and_activation() {
 		// Typed accepted results close exactly the real admission's four members.
 		for unit in [3,6,4,5] {record(unit,coverage)?;}
 		tx.execute("UPDATE jobs SET state='succeeded',finished_at=5 WHERE id=?1",[coverage])?;
-		assert_eq!(campaign::replenish(tx,campaign_id,5).unwrap(),None);
 		assert!(generations::coverage_rollup(tx,generation)?.complete());
 		let after=generations::get(tx,generation)?.unwrap();
 		assert_eq!(after.profile_version,1);
 		assert_eq!(after.activated_at,Some(3));
 		assert_eq!(campaign::try_finish(tx,campaign_id,5).unwrap(),Some(campaign::Finish::Completed));
+		assert_eq!(tx.query_row("SELECT COUNT(*) FROM jobs WHERE campaign_id=?1",[campaign_id],|r|r.get::<_,i64>(0))?,2);
+		assert_eq!(loupe_storage::admission::get_spending(tx,campaign_id)?.unwrap().total()?,2);
 		let row=campaigns::get(tx,campaign_id)?.unwrap();
 		assert_eq!(row.state,campaigns::State::Finished);
 		assert!(row.terminal_counts.is_some());

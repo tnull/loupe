@@ -113,22 +113,18 @@ fn campaign_creation_freezes_v2_and_charges_only_preparation_once() {
 }
 
 #[test]
-fn coverage_replenishment_never_allocates_a_speculative_child() {
+fn coverage_maintenance_keeps_work_pending_without_allocating_a_child() {
 	let db = fixture();
 	db.with_conn(|conn| {
 		transaction::immediate(conn, |tx| {
 			let (campaign, _) = idle_campaign(tx, 1, &ReviewPolicy::default(), 0, true)?;
 			assert_eq!(
-				campaign::replenish(tx, campaign, 1)?,
+				campaign::try_finish(tx, campaign, 1)?,
 				None,
 				"coverage work must compete at first claim, not consume a queued child"
 			);
-			assert_eq!(
-				tx.query_row("SELECT COUNT(*) FROM jobs WHERE campaign_id=?1", [campaign], |r| {
-					r.get::<_, i64>(0)
-				})?,
-				1
-			);
+			assert_eq!(campaigns::get(tx, campaign)?.unwrap().state, campaigns::State::Active);
+			assert_campaign_allocations(tx, campaign, 1, 1)?;
 			Ok(())
 		})
 	})
