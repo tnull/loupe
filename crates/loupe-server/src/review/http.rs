@@ -118,6 +118,7 @@ pub fn is_phase_route(path: &str) -> bool {
 			| "/v1/jobs/{id}/seal-inventory"
 			| "/v1/jobs/{id}/publish-profile"
 			| "/v1/jobs/{id}/inventory-dispositions"
+			| "/v1/jobs/{id}/review-units"
 			| "/v1/jobs/{id}/limits"
 			| "/v1/jobs/{id}/lead-candidates"
 	)
