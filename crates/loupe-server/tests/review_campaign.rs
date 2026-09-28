@@ -15,6 +15,9 @@ const OTHER: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 #[path = "review_campaign_v2/mod.rs"]
 mod v2;
 
+#[path = "review_campaign_maintenance/mod.rs"]
+mod maintenance;
+
 fn fixture() -> Db {
 	let db = Db::open_in_memory(&loupe_storage::secrets::MasterKey::for_tests()).unwrap();
 	db.with_conn(|c| {
@@ -42,12 +45,21 @@ fn created(opened: Opened) -> (i64, i64) {
 }
 
 fn ready(tx: &rusqlite::Transaction<'_>, generation: i64) -> loupe_storage::Result<()> {
+	use loupe_core::inventory_manifest::{ManifestEntry, ManifestHasher};
+	let commit = generations::get(tx, generation)?.unwrap().commit_sha;
+	let entry =
+		ManifestEntry { raw_path: b"src.rs".to_vec(), git_mode: 0o100644, object_id: SHA.into() };
+	let mut manifest = ManifestHasher::new(&commit, 1).unwrap();
+	manifest.push(&entry).unwrap();
+	let bytes = manifest.bytes();
+	let digest = manifest.finish().unwrap();
 	generations::set_profile(tx, generation, 1, &BoundedJson::<Payload>::new("{}")?)?;
 	tx.execute(
-		"UPDATE review_generations SET inventory_digest=zeroblob(32) WHERE generation_id=?1",
-		[generation],
+		"UPDATE review_generations SET inventory_digest=?2 WHERE generation_id=?1",
+		rusqlite::params![generation, digest.as_slice()],
 	)?;
-	tx.execute("INSERT INTO generation_manifests(generation_id,format_version,expected_entry_count,expected_digest,created_at,sealed_at) VALUES(?1,1,0,zeroblob(32),0,0)",[generation])?;
+	tx.execute("INSERT INTO generation_manifests(generation_id,format_version,expected_entry_count,received_entry_count,received_canonical_bytes,expected_digest,created_at,sealed_at) VALUES(?1,1,1,1,?2,?3,0,0)",rusqlite::params![generation,bytes,digest.as_slice()])?;
+	tx.execute("INSERT INTO generation_inventory(generation_id,path,source_path,raw_path,manifest_position,git_mode,blob_sha,entry_kind,disposition,disposition_reason,created_at) VALUES(?1,'src.rs','src.rs',?2,0,33188,?3,'tracked','context','fixture source',0)",rusqlite::params![generation,b"src.rs".as_slice(),SHA])?;
 	Ok(())
 }
 
@@ -61,14 +73,14 @@ fn idle_campaign(
 	ready(tx, generation)?;
 	campaign::activate_generation(tx, campaign_id, now)?;
 	tx.execute(
-		"UPDATE jobs SET state='succeeded',finished_at=?2 WHERE id=?1",
-		rusqlite::params![job_id, now],
+		"UPDATE jobs SET state='succeeded',finished_at=?2,head_sha=?3 WHERE id=?1",
+		rusqlite::params![job_id, now, SHA],
 	)?;
 	if has_work {
 		tx.execute(
 			"INSERT INTO review_units(generation_id,client_review_unit_key,title,objective,
-			 source_refs,priority_band,created_at) VALUES(?1,'u','t','o','[]','high',0)",
-			[generation],
+			 source_refs,priority_band,created_by_job_id,created_at) VALUES(?1,'u','t','o','[{\"path\":\"src.rs\"}]','high',?2,0)",
+			rusqlite::params![generation, job_id],
 		)?;
 	}
 	Ok((campaign_id, generation))
@@ -578,10 +590,22 @@ fn deadline_cancels_only_queued_work_and_waits_for_the_leased_child() {
 	let db = fixture();
 	db.with_conn(|c| {
 		transaction::immediate(c, |tx| {
-			let (id, leased) = created(campaign::open(tx, &request(RequestedRef::Branch("main")), &ReviewPolicy::default(), 0)?);
-			tx.execute("UPDATE jobs SET state='leased' WHERE id=?1", [leased])?;
-			tx.execute("INSERT INTO jobs(repo_id,kind,state,campaign_id,enqueued_at) VALUES(1,'survey','queued',?1,1)", [id])?;
-			let queued = tx.last_insert_rowid();
+			let policy = ReviewPolicy { survey_units_per_job: 1, active_surveys_per_repo: 2, ..ReviewPolicy::default() };
+			let (id, generation) = idle_campaign(tx, 1, &policy, 0, true)?;
+			tx.execute("INSERT INTO review_units(generation_id,client_review_unit_key,title,objective,source_refs,created_at) VALUES(?1,'second','Second unit','Review boundary','[{\"path\":\"src.rs\"}]',0)",[generation])?;
+			let worker=loupe_storage::workers::insert(tx,"deadline",loupe_storage::workers::WorkerKind::Worker,&[4;32],0)?;
+			let claim_policy=policy.claim_policy();
+			let req=loupe_storage::admission_candidates::Request {worker_id:worker,legacy_kinds:&[],phase_kinds:&[JobKind::Survey],now:1,policy:&claim_policy,limit:1};
+			let mut children=Vec::new();
+			for capability in 5..7 {
+				let candidate=loupe_storage::admission_candidates::ranked(tx,&req)?.remove(0);
+				let loupe_storage::admission_claim::Outcome::Uncommitted(claimed)=loupe_storage::admission_claim::materialize(tx,&candidate,&req,&[capability;32],22000)? else {panic!("coverage claim")};
+				assert_eq!(claimed.assigned_units.len(),1);
+				children.push(claimed.job.id);
+			}
+			let (leased,queued)=(children[0],children[1]);
+			// A real execution retry retains its original charge and exact assignment.
+			tx.execute("UPDATE jobs SET state='queued',worker_id=NULL,lease_expires_at=NULL,job_capability_hash=NULL,eligible_at=21600 WHERE id=?1",[queued])?;
 			assert_eq!(campaign::try_finish(tx, id, 21599)?, None);
 			assert_eq!(jobs::get(tx, queued)?.unwrap().state, JobState::Queued);
 			assert_eq!(campaign::try_finish(tx, id, 21600)?, None);
@@ -590,22 +614,32 @@ fn deadline_cancels_only_queued_work_and_waits_for_the_leased_child() {
 			assert_eq!(cancelled.error.as_deref(), Some("campaign_deadline"));
 			assert_eq!(jobs::get(tx, leased)?.unwrap().state, JobState::Leased);
 			assert_eq!(campaign::replenish(tx, id, 21600)?, None);
-			tx.execute("UPDATE jobs SET state='succeeded',finished_at=21601 WHERE id=?1", [leased])?;
-			assert_eq!(campaign::try_finish(tx, id, 21601)?, Some(campaign::Finish::DeadlineReached));
+			tx.execute(
+				"UPDATE jobs SET state='succeeded',finished_at=21601 WHERE id=?1",
+				[leased],
+			)?;
+			assert_eq!(
+				campaign::try_finish(tx, id, 21601)?,
+				Some(campaign::Finish::DeadlineReached)
+			);
 			let row = campaigns::get(tx, id)?.unwrap();
 			assert_eq!(row.terminal_reason.unwrap().expose(), "deadline");
 			assert!(row.terminal_counts.is_some());
 			assert!(row.coverage_at_finish.is_some());
 			Ok(())
 		})
-	}).unwrap();
+	})
+	.unwrap();
 }
 
 #[test]
 fn tick_without_active_campaigns_performs_no_writes() {
 	let db = fixture();
 	let before = db.with_conn(|c| Ok(c.total_changes())).unwrap();
-	assert_eq!(campaign::tick(&db, 1).unwrap(), campaign::TickReport::default());
+	assert_eq!(
+		campaign::tick(&db, 1, &mut campaign::Maintenance::default()).unwrap(),
+		campaign::TickReport::default()
+	);
 	assert_eq!(db.with_conn(|c| Ok(c.total_changes())).unwrap(), before);
 	db.with_conn(|c| {
 		transaction::immediate(c, |tx| {
@@ -616,7 +650,10 @@ fn tick_without_active_campaigns_performs_no_writes() {
 	})
 	.unwrap();
 	let before = db.with_conn(|c| Ok(c.total_changes())).unwrap();
-	assert_eq!(campaign::tick(&db, 2).unwrap(), campaign::TickReport::default());
+	assert_eq!(
+		campaign::tick(&db, 2, &mut campaign::Maintenance::default()).unwrap(),
+		campaign::TickReport::default()
+	);
 	assert_eq!(db.with_conn(|c| Ok(c.total_changes())).unwrap(), before);
 }
 
@@ -637,7 +674,7 @@ fn tick_reports_budget_exhaustion_once_without_claiming_complete_coverage() {
 			})
 		})
 		.unwrap();
-	let report = campaign::tick(&db, 1).unwrap();
+	let report = campaign::tick(&db, 1, &mut campaign::Maintenance::default()).unwrap();
 	assert_eq!(report.completed, 1);
 	assert_eq!(report.enqueued, 0);
 	assert_eq!(report.budget_exhausted, 1);
@@ -648,7 +685,10 @@ fn tick_reports_budget_exhaustion_once_without_claiming_complete_coverage() {
 		Ok(())
 	})
 	.unwrap();
-	assert_eq!(campaign::tick(&db, 2).unwrap(), campaign::TickReport::default());
+	assert_eq!(
+		campaign::tick(&db, 2, &mut campaign::Maintenance::default()).unwrap(),
+		campaign::TickReport::default()
+	);
 }
 
 #[test]
@@ -663,7 +703,7 @@ fn tick_rolls_back_a_failed_campaign_and_still_processes_other_repositories() {
 			Ok(first)
 		})
 	}).unwrap();
-	let report = campaign::tick(&db, 1).unwrap();
+	let report = campaign::tick(&db, 1, &mut campaign::Maintenance::default()).unwrap();
 	assert_eq!(report.failed, 1);
 	assert_eq!(report.completed, 1);
 	assert_eq!(report.enqueued, 0);
@@ -676,7 +716,7 @@ fn tick_rolls_back_a_failed_campaign_and_still_processes_other_repositories() {
 		Ok(())
 	})
 	.unwrap();
-	let report = campaign::tick(&db, 2).unwrap();
+	let report = campaign::tick(&db, 2, &mut campaign::Maintenance::default()).unwrap();
 	assert_eq!(report.failed, 0);
 	assert_eq!(report.completed, 1);
 	assert_eq!(report.enqueued, 0);

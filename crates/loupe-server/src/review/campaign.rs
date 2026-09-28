@@ -1,9 +1,12 @@
 //! Transactional campaign orchestration. Worker checkout pins the commit.
+use std::collections::BTreeMap;
+
 use loupe_core::text::policy::Reason;
 use loupe_core::text::{BoundedJson, BoundedText};
 use loupe_core::{JobKind, JobState, WORKFLOW_CONTRACT_VERSION};
 use loupe_storage::admission::{self, CapacityRefusal, Selection};
 use loupe_storage::admission_policy::CampaignPolicyV2;
+use loupe_storage::admission_quarantine::Cursor;
 use loupe_storage::review_intents::BlockReason;
 use loupe_storage::{
 	admission_claim, campaign_work, campaigns, generations, jobs, scheduler, transaction, Conflict,
@@ -311,8 +314,37 @@ struct Progress {
 	budget_exhausted: bool,
 }
 
+/// A bounded one-shot attempt. Large campaigns need the retained cursor in
+/// `tick`; an incomplete integrity pass never permits normal completion.
 pub fn try_finish(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Option<Finish>> {
-	Ok(advance(tx, campaign_id, now)?.finish)
+	Ok(advance_checked(tx, campaign_id, now, None)?.0.finish)
+}
+
+/// Process-local scan progress, not persisted coverage or admission authority.
+/// The background owner retains this across ticks; restart safely rescans.
+#[derive(Debug, Default)]
+pub struct Maintenance {
+	cursors: BTreeMap<i64, Cursor>,
+}
+
+fn advance_checked(
+	tx: &Transaction<'_>, campaign_id: i64, now: i64, cursor: Option<Cursor>,
+) -> Result<(Progress, Option<Cursor>)> {
+	let (active, deadline): (bool, Option<i64>) = tx
+		.query_row(
+			"SELECT state='active',deadline_at FROM review_campaigns WHERE campaign_id=?1",
+			[campaign_id],
+			|r| Ok((r.get(0)?, r.get(1)?)),
+		)
+		.optional()?
+		.ok_or(Error::NotFound(Entity::Campaign, campaign_id))?;
+	// Control transitions cannot depend on a domain-integrity walk succeeding.
+	if !active || deadline.is_some_and(|at| at <= now) {
+		return Ok((advance(tx, campaign_id, now, false)?, None));
+	}
+	let scan =
+		super::admission_validation::maintain_campaign(tx, campaign_id, now, cursor, 256, 32)?;
+	Ok((advance(tx, campaign_id, now, scan.scan_complete)?, scan.next))
 }
 
 fn frozen_budget(
@@ -325,7 +357,9 @@ fn frozen_budget(
 	Ok((policy, spending))
 }
 
-fn advance(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Progress> {
+fn advance(
+	tx: &Transaction<'_>, campaign_id: i64, now: i64, scan_complete: bool,
+) -> Result<Progress> {
 	// Lifecycle decisions do not deserialize model prose or historical policy.
 	let (state, recipe, deadline): (String, String, Option<i64>) = tx
 		.query_row(
@@ -373,6 +407,9 @@ fn advance(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Progress>
 			&BoundedText::new(reason.as_str())?,
 		)?;
 		campaign_work::block_all(tx, campaign_id, reason, now)?;
+	}
+	if terminal_reason.is_none() && !scan_complete {
+		return Ok(progress);
 	}
 	let busy: bool = tx.query_row(
 		"SELECT EXISTS(SELECT 1 FROM jobs WHERE campaign_id=?1 AND state IN ('queued','leased'))",
@@ -436,7 +473,7 @@ fn advance(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Progress>
 
 /// No active campaigns means no write transaction. Each campaign otherwise
 /// advances independently, so a malformed row cannot stall another repository.
-pub fn tick(db: &Db, now: i64) -> Result<TickReport> {
+pub fn tick(db: &Db, now: i64, maintenance: &mut Maintenance) -> Result<TickReport> {
 	let active: Vec<i64> = db.with_conn(|c| {
 		Ok(c.prepare(
 			"SELECT campaign_id FROM review_campaigns WHERE state='active' ORDER BY campaign_id",
@@ -444,11 +481,14 @@ pub fn tick(db: &Db, now: i64) -> Result<TickReport> {
 		.query_map([], |r| r.get(0))?
 		.collect::<rusqlite::Result<_>>()?)
 	})?;
+	maintenance.cursors.retain(|id, _| active.binary_search(id).is_ok());
 	let mut report = TickReport::default();
 	for campaign_id in active {
-		let progress =
-			db.with_conn(|c| transaction::immediate(c, |tx| advance(tx, campaign_id, now)));
-		let progress = match progress {
+		let cursor = maintenance.cursors.get(&campaign_id).copied();
+		let result = db.with_conn(|c| {
+			transaction::immediate(c, |tx| advance_checked(tx, campaign_id, now, cursor))
+		});
+		let (progress, next) = match result {
 			Ok(progress) => progress,
 			Err(error) => {
 				report.failed += 1;
@@ -456,6 +496,12 @@ pub fn tick(db: &Db, now: i64) -> Result<TickReport> {
 				continue;
 			},
 		};
+		// The transaction committed: only now may process-local progress move.
+		if let Some(next) = next.filter(|_| progress.finish.is_none()) {
+			maintenance.cursors.insert(campaign_id, next);
+		} else {
+			maintenance.cursors.remove(&campaign_id);
+		}
 		match progress.finish {
 			Some(Finish::Completed) => report.completed += 1,
 			Some(Finish::DeadlineReached) => report.deadline_reached += 1,

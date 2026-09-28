@@ -1,18 +1,68 @@
 //! Campaign completion must inspect durable work, not just materialized jobs.
+use loupe_core::review_payload::{
+	ContinuationClass, LeadEvidenceV1, PromotionV1, UnitResultPayloadV1,
+};
+use loupe_storage::admission_policy::AcceptedPriority;
+use loupe_storage::{
+	leads, review_findings, review_intents, review_unit_results, review_units, unit_holds,
+};
 use rusqlite::params;
 
 use super::*;
 
+fn priority() -> AcceptedPriority {
+	AcceptedPriority { band: loupe_storage::scheduler::Band::Normal, score: 0 }
+}
+
+fn lead_evidence(
+	tx: &rusqlite::Transaction<'_>, generation: i64, producer: i64, anchor: &str,
+) -> loupe_storage::Result<i64> {
+	let payload = LeadEvidenceV1::from_json(
+		&serde_json::json!({
+			"format":"loupe.lead_evidence","version":1,"identity_family":"family",
+			"identity_anchor":anchor,"hypothesis":"An unchecked request reaches the allocator",
+			"source_refs":[{"path":"src.rs"}],"next_proof_step":"Inspect callers",
+			"counterevidence":"Some callers validate the request","proof_gaps":"Review remaining callers"
+		})
+		.to_string(),
+	)?;
+	let leads::Submitted::Created(id) = leads::submit_evidence(
+		tx,
+		&leads::NewLeadEvidence {
+			generation_id: generation,
+			created_by_job: producer,
+			commit_sha: SHA,
+			priority: review_units::Priority::Normal,
+			payload: &payload,
+		},
+		0,
+	)?
+	else {
+		panic!("new fixture lead")
+	};
+	Ok(id)
+}
+
+// A retained terminal producer is not a newly allocated pending-work child.
+fn retained_drilldown(
+	tx: &rusqlite::Transaction<'_>, campaign: i64, generation: i64, parent: i64, lead: i64,
+) -> loupe_storage::Result<i64> {
+	tx.execute("INSERT INTO jobs(repo_id,kind,state,campaign_id,generation_id,parent_job_id,assigned_lead_id,head_sha,workflow_contract_version,scheduling_band,effective_priority,recipe,enqueued_at,finished_at) VALUES(1,'drilldown','succeeded',?1,?2,?3,?4,?5,1,'normal',0,'{\"version\":1,\"phase\":\"drilldown\"}',0,0)",params![campaign,generation,parent,lead,SHA])?;
+	Ok(tx.last_insert_rowid())
+}
+
 fn pending_lead(
 	tx: &rusqlite::Transaction<'_>, campaign: i64, generation: i64, job: i64, due: Option<i64>,
 ) -> loupe_storage::Result<()> {
-	let (kind, class, sequence) = if due.is_some() {
-		("logical_continuation", Some("source_analysis_remaining"), 1)
-	} else {
-		("initial_handoff", None, 0)
-	};
-	tx.execute("INSERT INTO leads(lead_id,generation_id,identity_family,identity_anchor,identity_fingerprint,anchored_payload,anchored_digest,commit_sha,created_by_job_id,created_at) VALUES(1,?1,'family','anchor',zeroblob(32),'{}',zeroblob(32),?2,?3,0)",params![generation,SHA,job])?;
-	tx.execute("INSERT INTO lead_drilldown_intents(lead_id,repo_id,generation_id,originating_job_id,originating_campaign_id,admission_campaign_id,source_commit_sha,profile_version,profile_digest,intent_revision,intent_kind,continuation_class,logical_sequence,state,not_before,accepted_band,accepted_score,priority_policy_version,created_at,updated_at) VALUES(1,1,?1,?2,?3,?3,?4,1,zeroblob(32),1,?5,?6,?7,'pending',?8,'normal',0,1,0,0)",params![generation,job,campaign,SHA,kind,class,sequence,due])?;
+	let lead = lead_evidence(tx, generation, job, "pending boundary")?;
+	review_intents::ensure_drilldown_intent(tx, lead, job, priority(), 0)?.unwrap();
+	if let Some(due) = due {
+		let producer = retained_drilldown(tx, campaign, generation, job, lead)?;
+		leads::defer(tx, lead, &BoundedText::new("source_analysis_remaining")?, None)?;
+		// The fixture starts at a retained logical revision; its producer must
+		// be the terminal drilldown for this lead, never the original survey.
+		tx.execute("UPDATE lead_drilldown_intents SET originating_job_id=?2,intent_kind='logical_continuation',continuation_class='source_analysis_remaining',logical_sequence=1,not_before=?3 WHERE lead_id=?1",params![lead,producer,due])?;
+	}
 	Ok(())
 }
 
@@ -129,8 +179,35 @@ fn delayed_pending_work_due_before_deadline_keeps_campaign_active() {
 fn pending_finding(
 	tx: &rusqlite::Transaction<'_>, campaign: i64, generation: i64, job: i64,
 ) -> loupe_storage::Result<()> {
-	tx.execute("INSERT INTO findings(id,repo_id,job_id,scanner_id,severity,title,description,fingerprint,state,created_at) VALUES(1,1,?1,'review','high','Canonical finding','Complete original evidence','finding','validating',0)",[job])?;
-	tx.execute("INSERT INTO finding_verification_intents(finding_id,repo_id,generation_id,originating_job_id,originating_campaign_id,admission_campaign_id,source_commit_sha,profile_version,profile_digest,intent_revision,intent_kind,logical_sequence,state,accepted_band,accepted_score,priority_policy_version,created_at,updated_at) VALUES(1,1,?1,?2,?3,?3,?4,1,zeroblob(32),1,'initial_handoff',0,'pending','normal',0,1,0,0)",params![generation,job,campaign,SHA])?;
+	// Promotion closes a different origin lead, leaving the normal pending
+	// lead available as the protected-pool negative control.
+	let origin = lead_evidence(tx, generation, job, "promoted boundary")?;
+	let producer = retained_drilldown(tx, campaign, generation, job, origin)?;
+	let promotion = PromotionV1::from_json(&serde_json::json!({
+		"version":1,"severity":"high","title":"Canonical finding",
+		"description":"Complete original evidence","identity_family":"family",
+		"identity_anchor":"promoted boundary","evidence":{"version":1,
+		"l2_argument":{"attacker_source":"request","control":"request length",
+		"sink":"allocator","reachable_path":"handler to allocator","trust_boundary":"network to memory"},
+		"material_locations":[{"role":"sink","file":"src.rs"}],
+		"counterevidence":"Caller guard","assumptions_gaps":"Some callers omit the guard","confidence":"medium"}
+	}).to_string())?;
+	let profile = BoundedJson::<Payload>::new("{}")?;
+	let finding = review_findings::insert(
+		tx,
+		&review_findings::NewFinding {
+			repo_id: 1,
+			job_id: producer,
+			origin_lead_id: origin,
+			profile_version: 1,
+			profile_digest: profile.digest(),
+			reviewed_commit_sha: SHA,
+			promotion: &promotion,
+		},
+		0,
+	)?;
+	leads::close(tx, origin, &leads::Closure::Promoted { finding }, 0)?;
+	review_intents::ensure_verification_intent(tx, finding, producer, priority(), 0)?.unwrap();
 	Ok(())
 }
 
@@ -142,12 +219,13 @@ fn protected_capacity_blocks_normal_lead_but_keeps_verification_pending() {
 		let job=tx.query_row("SELECT id FROM jobs WHERE campaign_id=?1",[campaign],|r|r.get(0))?;
 		pending_lead(tx,campaign,generation,job,None)?;
 		pending_finding(tx,campaign,generation,job)?;
+		let before_jobs=tx.query_row("SELECT COUNT(*) FROM jobs",[],|r|r.get::<_,i64>(0))?;
 		tx.execute("UPDATE campaign_admission_spending SET general_spent=56 WHERE campaign_id=?1",[campaign])?;
 		assert_eq!(campaign::try_finish(tx,campaign,1)?,None);
 		assert_eq!(tx.query_row("SELECT block_reason FROM lead_drilldown_intents",[],|r|r.get::<_,String>(0))?,"protected_capacity");
 		assert_eq!(tx.query_row("SELECT state FROM finding_verification_intents",[],|r|r.get::<_,String>(0))?,"pending");
 		assert_eq!(tx.query_row("SELECT defer_reason FROM review_units",[],|r|r.get::<_,String>(0))?,"protected_capacity");
-		assert_eq!(tx.query_row("SELECT COUNT(*) FROM jobs",[],|r|r.get::<_,i64>(0))?,1,"no speculative verification child");
+		assert_eq!(tx.query_row("SELECT COUNT(*) FROM jobs",[],|r|r.get::<_,i64>(0))?,before_jobs,"no speculative verification child");
 		tx.execute("UPDATE campaign_admission_spending SET urgent_spent=4,verification_spent=4 WHERE campaign_id=?1",[campaign])?;
 		assert_eq!(campaign::try_finish(tx,campaign,2)?,Some(campaign::Finish::Completed));
 		assert_eq!(tx.query_row("SELECT block_reason FROM finding_verification_intents",[],|r|r.get::<_,String>(0))?,"campaign_budget");
@@ -179,10 +257,42 @@ fn due_at_or_beyond_deadline_is_retained_as_blocked_not_polled() {
 fn held_batch(
 	tx: &rusqlite::Transaction<'_>, campaign: i64, generation: i64, job: i64,
 ) -> loupe_storage::Result<()> {
-	tx.execute("INSERT INTO review_units(review_unit_id,generation_id,client_review_unit_key,title,objective,source_refs,created_at) VALUES(1,?1,'held','unit','unfinished','[]',0)",[generation])?;
-	tx.execute("INSERT INTO review_unit_results(review_unit_result_id,review_unit_id,produced_by_job_id,commit_sha,profile_version,disposition,inspected_refs,result_payload,result_digest,created_at) VALUES(1,1,?1,?2,1,'needs_follow_up','[]','{}',zeroblob(32),0)",params![job,SHA])?;
-	tx.execute("INSERT INTO survey_continuation_batches(batch_id,repo_id,generation_id,campaign_id,producer_job_id,batch_ordinal,logical_sequence,continuation_class,state,not_before,expected_unit_count,accepted_band,accepted_score,priority_policy_version,created_at) VALUES(1,1,?1,?2,?3,0,1,'source_analysis_remaining','pending',100,1,'normal',0,1,0)",params![generation,campaign,job])?;
-	tx.execute("INSERT INTO review_unit_holds(review_unit_id,generation_id,producing_job_id,producing_result_id,source_assignment_epoch,continuation_class,pending_batch_id,batch_position,created_at,updated_at) VALUES(1,?1,?2,1,0,'source_analysis_remaining',1,0,0,0)",params![generation,job])?;
+	assert_eq!(jobs::get(tx, job)?.unwrap().campaign_id, Some(campaign));
+	tx.execute("INSERT INTO review_units(review_unit_id,generation_id,client_review_unit_key,title,objective,source_refs,created_by_job_id,created_at) VALUES(1,?1,'held','unit','unfinished','[{\"path\":\"src.rs\"}]',?2,0)",params![generation,job])?;
+	let payload = UnitResultPayloadV1::from_json(
+		&serde_json::json!({
+			"format":"loupe.unit_result","version":1,"review_unit_id":1,"assignment_epoch":0,
+			"disposition":"needs_follow_up","inspected_refs":[{"path":"src.rs"}],"created_lead_ids":[],
+			"counterevidence":"Guard found","proof_gaps":"Some callers remain","follow_up":"Review callers",
+			"continuation":"source_analysis_remaining"
+		})
+		.to_string(),
+	)?;
+	let result = review_unit_results::insert_evidence(
+		tx,
+		&review_unit_results::NewResultEvidence {
+			generation_id: generation,
+			produced_by_job: job,
+			commit_sha: SHA,
+			profile_version: 1,
+			payload: &payload,
+		},
+		0,
+	)?;
+	tx.execute("UPDATE jobs SET state='leased',finished_at=NULL WHERE id=?1", [job])?;
+	unit_holds::record_follow_up(
+		tx,
+		1,
+		result,
+		job,
+		0,
+		ContinuationClass::SourceAnalysisRemaining,
+		0,
+	)?;
+	tx.execute("UPDATE jobs SET state='succeeded',finished_at=0 WHERE id=?1", [job])?;
+	let batches = unit_holds::freeze_survey_batches(tx, job, 0)?;
+	assert_eq!(batches.len(), 1);
+	assert!(batches[0].not_before.is_some_and(|due| due > 2));
 	Ok(())
 }
 
@@ -409,10 +519,14 @@ fn queued_execution_retry_remains_active_without_spending_again() {
 	db.with_conn(|conn| {
 		transaction::immediate(conn, |tx| {
 			let (campaign, _) = idle_campaign(tx, 1, &ReviewPolicy::default(), 0, false)?;
+			let job=tx.query_row("SELECT id FROM jobs WHERE campaign_id=?1",[campaign],|r|r.get(0))?;
 			tx.execute(
-				"UPDATE jobs SET state='queued',eligible_at=100,attempts=1 WHERE campaign_id=?1",
+				"UPDATE jobs SET state='queued',finished_at=NULL,eligible_at=100,attempts=1,recipe='{\"version\":1,\"phase\":\"survey\",\"recipe\":\"coverage\",\"assignment_key\":\"ordinary\"}' WHERE campaign_id=?1",
 				[campaign],
 			)?;
+			// An empty initial assignment is still durable retry history; a
+			// missing marker must not allow an execution retry to select new work.
+			assert!(loupe_storage::scheduler::initialize_ordinary_batch(tx,job,0)?.units.is_empty());
 			assert_eq!(campaign::try_finish(tx, campaign, 1)?, None);
 			assert_eq!(loupe_storage::admission::get_spending(tx, campaign)?.unwrap().total()?, 1);
 			assert_eq!(tx.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get::<_, i64>(0))?, 1);
