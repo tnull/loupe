@@ -48,6 +48,7 @@ pub enum Conflict {
 	Candidate,
 	TerminalReceipt,
 	FindingIdentity(i64),
+	CompatibilityKey(i64),
 	FindingDetails,
 	AttemptDetails,
 	ArtifactIdentity,
