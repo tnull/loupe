@@ -119,6 +119,10 @@ impl Authorized<'_, '_> {
 		self.lease.job()
 	}
 
+	pub fn is_bootstrap(&self) -> bool {
+		self.bootstrap
+	}
+
 	/// Fresh-only subject checks belong inside `checkpoints::run`'s callback,
 	/// after exact replay lookup. Scope alone never grants payload/quota validity.
 	pub fn survey_unit(&self, unit: i64, epoch: i64) -> Result<bool> {

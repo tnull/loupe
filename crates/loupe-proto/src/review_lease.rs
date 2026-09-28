@@ -49,7 +49,7 @@ impl IdentPolicy for CommitPolicy {
 	const FIELD: &'static str = "commit_sha";
 	const MAX_LEN: usize = 64;
 	fn accepts(value: &str) -> bool {
-		matches!(value.len(), 40 | 64) && lower_hex(value)
+		loupe_core::inventory_manifest::is_git_oid(value)
 	}
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

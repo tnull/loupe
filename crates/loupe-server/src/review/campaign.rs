@@ -159,17 +159,10 @@ pub fn open(
 	Ok(Opened::Created { campaign_id, job_id })
 }
 
-/// A complete, lowercase Git object id (SHA-1 or SHA-256). The pinned commit
-/// comes from the worker's checkout checkpoint, so it is boundary input and
-/// nothing else may reach `target_commit_sha` or generation selection.
-fn is_commit_sha(sha: &str) -> bool {
-	matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
 pub fn pin(
 	tx: &Transaction<'_>, campaign_id: i64, job_id: i64, sha: &str, now: i64,
 ) -> Result<i64> {
-	if !is_commit_sha(sha) {
+	if !loupe_core::inventory_manifest::is_git_oid(sha) {
 		return Err(
 			loupe_core::text::Error::new("commit_sha", loupe_core::text::Rule::Identifier).into()
 		);

@@ -3,7 +3,7 @@ mod claim;
 mod policy;
 #[cfg(test)]
 use claim::claim_kinds;
-pub use claim::{claim, ClaimRequest, Claimed};
+pub use claim::{claim, initialize_ordinary_batch, BatchInitialization, ClaimRequest, Claimed};
 use loupe_core::text::policy::{Payload, Reason};
 use loupe_core::text::{BoundedJson, BoundedText};
 use loupe_core::{JobKind, JobState, WORKFLOW_CONTRACT_VERSION};

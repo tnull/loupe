@@ -128,8 +128,7 @@ impl Lease<'_, '_> {
 	pub fn prepared(&self, context: &Context) -> Result<bool> {
 		let Some(generation) = &context.generation else { return Ok(false) };
 		let Some(head) = &context.head_sha else { return Ok(false) };
-		if !matches!(head.len(), 40 | 64)
-			|| !head.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+		if !loupe_core::inventory_manifest::is_git_oid(head)
 			|| *head != context.target_commit
 			|| *head != generation.commit
 		{

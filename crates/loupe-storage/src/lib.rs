@@ -12,6 +12,7 @@ mod db;
 pub mod finding_details;
 pub mod findings;
 pub mod generations;
+pub mod host_preparation;
 pub mod identity;
 pub mod inventory;
 pub mod jobs;

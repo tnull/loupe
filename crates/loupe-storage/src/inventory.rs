@@ -8,7 +8,7 @@ use crate::{ownership, Conflict, Error, Ownership, Result};
 string_enum!(EntryKind { Tracked => "tracked", Submodule => "submodule" });
 string_enum!(Disposition { Mapped => "mapped", Context => "context", Excluded => "excluded", Unresolved => "unresolved" });
 pub const MAX_ENTRIES: usize = 4096;
-pub const MAX_RAW_PATH_BYTES: usize = 64 * 1024;
+pub const MAX_RAW_PATH_BYTES: usize = loupe_core::inventory_manifest::MAX_PATH_BYTES;
 
 #[derive(Clone)]
 pub struct InventoryPath {

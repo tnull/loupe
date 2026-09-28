@@ -161,41 +161,63 @@ fn claim_filtered(
 			.ok_or_else(|| invalid("lease_expires_at"))?
 			.min(bound);
 		tx.execute("UPDATE jobs SET hard_deadline_at=?2,submit_by=?3,soft_deadline_at=?3,lease_expires_at=?4 WHERE id=?1",params![job.id,hard,submit,lease])?;
-		if job.kind == JobKind::Survey
-			&& let Some(generation) = job.generation_id
-		{
-			let batch_exists: bool = tx.query_row(
-				"SELECT EXISTS(SELECT 1 FROM job_assigned_review_units WHERE job_id=?1)",
-				[job.id],
-				|r| r.get(0),
-			)?;
-			if batch_exists {
-				resumed = true;
-			} else if !is_bootstrap(&job) {
-				// This host-only, once-per-job operation has no request payload.
-				// Record even an empty selection atomically with the lease so a
-				// retry cannot confuse it with a skipped (e.g. unpinned) batch.
-				let initialized = checkpoints::run(
-					tx,
-					job.id,
-					checkpoints::Operation::InitializeSurveyBatch,
-					&Identifier::new("ordinary")?,
-					&Sha256::digest(b"{}").into(),
-					req.now,
-					|tx| {
-						let units = tx.prepare(&format!("SELECT u.review_unit_id,u.assignment_epoch FROM review_units u JOIN review_generations g ON g.generation_id=u.generation_id WHERE u.generation_id=?1 AND {} ORDER BY CASE u.priority_band WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,u.created_at,u.review_unit_id LIMIT ?2",*review_units::UNIT_NEEDS_WORK))?
-							.query_map(params![generation,policy.survey_units_per_job],|r|Ok(review_units::Assignment{unit_id:r.get(0)?,expected_epoch:r.get(1)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
-						review_units::assign(tx, job.id, &units)?;
-						Ok(BoundedJson::new("{}")?)
-					},
-				)?;
-				resumed = matches!(initialized, checkpoints::Outcome::Replayed(_));
-			}
-			assigned_units = tx.prepare("SELECT review_unit_id FROM job_assigned_review_units WHERE job_id=?1 AND completed=0 ORDER BY position")?.query_map([job.id],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+		if job.kind == JobKind::Survey && job.generation_id.is_some() {
+			let batch = initialize_ordinary_batch(tx, job.id, req.now)?;
+			assigned_units = batch.units;
+			resumed = batch.resumed;
 		}
 		job = jobs::get(tx, job.id)?.ok_or(Error::NotFound(Entity::Job, job.id))?;
 	}
 	Ok(Some(Claimed { job, assigned_units, resumed }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchInitialization {
+	pub units: Vec<i64>,
+	pub resumed: bool,
+}
+
+/// Host-only, once-per-logical-job selection, reusable after an unpinned lease
+/// acquires its generation. The caller authorizes recipe and preparation first.
+pub fn initialize_ordinary_batch(
+	tx: &Transaction<'_>, job_id: i64, now: i64,
+) -> Result<BatchInitialization> {
+	let job = jobs::get(tx, job_id)?.ok_or(Error::NotFound(Entity::Job, job_id))?;
+	let generation = job.generation_id.ok_or(Error::Conflict(crate::Conflict::Assignment))?;
+	if job.kind != JobKind::Survey {
+		return Err(Error::Conflict(crate::Conflict::Assignment));
+	}
+	let campaign_id = job.campaign_id.ok_or(Error::Conflict(crate::Conflict::Assignment))?;
+	let campaign =
+		campaigns::get(tx, campaign_id)?.ok_or(Error::NotFound(Entity::Campaign, campaign_id))?;
+	let policy = CampaignPolicy::from_snapshot(&campaign.effective_policy)?;
+	let batch_exists: bool = tx.query_row(
+		"SELECT EXISTS(SELECT 1 FROM job_assigned_review_units WHERE job_id=?1)",
+		[job.id],
+		|row| row.get(0),
+	)?;
+	let mut resumed = batch_exists;
+	if !batch_exists && !is_bootstrap(&job) {
+		// Even an empty batch is recorded. A retry cannot select newly added work.
+		let initialized = checkpoints::run(
+			tx,
+			job.id,
+			checkpoints::Operation::InitializeSurveyBatch,
+			&Identifier::new("ordinary")?,
+			&Sha256::digest(b"{}").into(),
+			now,
+			|tx| {
+				let units = tx.prepare(&format!("SELECT u.review_unit_id,u.assignment_epoch FROM review_units u JOIN review_generations g ON g.generation_id=u.generation_id WHERE u.generation_id=?1 AND {} ORDER BY CASE u.priority_band WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,u.created_at,u.review_unit_id LIMIT ?2",*review_units::UNIT_NEEDS_WORK))?
+					.query_map(params![generation,policy.survey_units_per_job],|r|Ok(review_units::Assignment{unit_id:r.get(0)?,expected_epoch:r.get(1)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+				review_units::assign(tx, job.id, &units)?;
+				Ok(BoundedJson::new("{}")?)
+			},
+		)?;
+		resumed = matches!(initialized, checkpoints::Outcome::Replayed(_));
+	}
+	let units = tx.prepare("SELECT review_unit_id FROM job_assigned_review_units WHERE job_id=?1 AND completed=0 ORDER BY position")?
+		.query_map([job.id], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+	Ok(BatchInitialization { units, resumed })
 }
 
 fn is_bootstrap(job: &JobRow) -> bool {

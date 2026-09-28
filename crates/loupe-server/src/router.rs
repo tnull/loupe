@@ -55,6 +55,10 @@ pub fn router(state: AppState) -> Router {
 		.route("/v1/jobs/{id}/llm-findings", post(routes::jobs::submit_llm_finding))
 		.route("/v1/jobs/{id}/verdict", post(routes::jobs::submit_verdict))
 		.route("/v1/jobs/{id}/complete", post(routes::jobs::complete))
+		.route("/v1/jobs/{id}/pin-target", post(routes::review_host::pin_target))
+		.route("/v1/jobs/{id}/inventory-batches", post(routes::review_host::inventory_batch))
+		.route("/v1/jobs/{id}/seal-inventory", post(routes::review_host::seal_inventory))
+		.route("/v1/jobs/{id}/publish-profile", post(routes::review_host::publish_profile))
 		.route_layer(axum::middleware::from_fn(auth::require_worker));
 
 	let authed = Router::new()
@@ -75,6 +79,22 @@ pub fn router(state: AppState) -> Router {
 		.with_state(state)
 		.layer(axum::middleware::from_fn(
 			|req: axum::extract::Request, next: axum::middleware::Next| async move {
+				let phase = req
+					.extensions()
+					.get::<axum::extract::MatchedPath>()
+					.is_some_and(|path| crate::review::http::is_phase_route(path.as_str()));
+				if phase {
+					let response = match crate::review::http::require_version(req.headers()) {
+						Ok(()) => next.run(req).await,
+						Err(error) => error.into_response(),
+					};
+					let mut response = crate::review::http::bound_phase_errors(response).await;
+					response.headers_mut().insert(
+						PROTOCOL_VERSION_HEADER,
+						PROTOCOL_VERSION.to_string().parse().expect("u16 header"),
+					);
+					return response;
+				}
 				if let Some(msg) =
 					request_protocol_error(req.headers().get(PROTOCOL_VERSION_HEADER))
 				{

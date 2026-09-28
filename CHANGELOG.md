@@ -11,6 +11,7 @@
 - Add campaign-aware review scheduling with frozen budgets, resumable survey batches, bounded fair claims, and deadline handling; preserve legacy leasing and keep survey/drilldown runtime-gated.
 - Add guarded schema v4 with lossless inventory paths and retained typed review evidence; preserve historical records and keep phase execution disabled (see the [offline upgrade runbook](contrib/upgrading-schema-v4.md)).
 - Isolate campaign capabilities from legacy routes and add transaction-bound review authority, assignment epochs and finishing-worker receipt replay; keep public phase execution disabled.
+- Add attempt-bound checkout preparation, resumable lossless manifests and immutable review-profile publication; return durable deferrals for unsupported successor work while public phase claims remain closed.
 
 ## v0.1 — 2026-09-07
 
