@@ -186,7 +186,7 @@ pub(crate) fn job_context(tx: &Transaction<'_>, id: i64) -> Result<JobContext> {
 	let profile = GeneratedProfile::new(&raw)?;
 	if !is_git_oid(&sha)
 		|| job.head_sha.as_ref().is_some_and(|head| head != &sha)
-		|| profile_version <= 0
+		|| !(1..=i64::from(u32::MAX)).contains(&profile_version)
 		|| profile.expose() != raw
 		|| profile.digest().as_slice() != profile_digest
 		|| job.workflow_contract_version != Some(1)

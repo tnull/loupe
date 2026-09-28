@@ -48,6 +48,40 @@ fn finding(tx: &Transaction<'_>, id: i64, lead_id: i64, job: i64) -> Result<()> 
 }
 
 #[test]
+fn intent_production_requires_a_lease_compatible_profile_version() {
+	for (version, accepted) in
+		[("1", true), ("4294967295", true), ("4294967296", false), ("1.5", false)]
+	{
+		fixture()
+			.with_conn(|conn| {
+				transaction::immediate(conn, |tx| {
+					lead(tx, 1)?;
+					tx.execute(
+						&format!("UPDATE review_generations SET profile_version={version} WHERE generation_id=11"),
+						[],
+					)?;
+					let produced = ensure_drilldown_intent(tx, 1, 101, NORMAL, 0);
+					assert_eq!(
+						produced.is_ok(), accepted,
+						"intent production must require a lease-compatible profile version: {version}"
+					);
+					let intent = get_subject(tx, Subject::Lead(1))?;
+					assert_eq!(intent.is_some(), accepted, "rejection must not insert an intent");
+					if let Some(intent) = intent {
+						assert_eq!(intent.profile_version.to_string(), version);
+					}
+					assert_eq!(
+						tx.query_row("SELECT CAST(profile_version AS TEXT) FROM review_generations WHERE generation_id=11", [], |r| r.get::<_, String>(0))?,
+						version, "validation must not rewrite the stored profile version"
+					);
+					Ok(())
+				})
+			})
+			.unwrap();
+	}
+}
+
+#[test]
 fn subject_first_admission_precedes_checkout_but_production_does_not() {
 	fixture()
 		.with_conn(|conn| {
