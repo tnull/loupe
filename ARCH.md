@@ -322,12 +322,13 @@ server" sections for the master-key sourcing rules.
 
 ## Storage layout for the review harness
 
-Schema v3 has a typed storage API ahead of the v2 scheduler and endpoints.
-It adds no phase routes, worker behavior, or migration. Only `scan` and
-`verify` are runtime-enabled: known but unsupported phase kinds and future
-kinds remain readable, but cannot be leased, mutated, or authorized by the
-legacy runtime. The startup guard still rejects kinds absent from the
-database's `job_kinds` table.
+Schema v4 and the B4 server support the pre-proof review API: prepared surveys,
+assigned-lead drilldowns and canonical-finding verification. Current workers
+still advertise only legacy capabilities; worker execution arrives in B5–B7,
+and production triggers remain legacy until cutover. Explicit phase
+advertisements never inherit legacy `verify:*` authority. Reconciliation,
+successor activation and corroboration remain B8-held; proof infrastructure
+remains Stage C. The startup guard rejects unknown database job kinds.
 
 | Modules | Responsibility |
 | --- | --- |
@@ -337,6 +338,41 @@ database's `job_kinds` table.
 | `checkpoints`, `terminal_receipt` | Operation-qualified replay and capability-bound terminal replay |
 | `finding_details`, `proofs` | Canonical review metadata and project-scoped proof rows |
 | `ownership`, `transaction` | In-transaction scope checks and standalone transaction boundaries |
+| `host_preparation`, `inventory_disposition` | Complete sealed manifest, immutable profile, attempt checkout and independent entry checkpoints |
+| `review_intents`, `unit_holds` | Pending handoffs, canonical verification obligations and exact continuation reservations |
+| `admission_candidates`, `admission_claim`, `admission` | Global ranked backlog, transactional first claim and monotonic protected budget |
+| `terminal_payloads`, `review_coverage` | Retained typed finalization evidence and shared current-result coverage validation |
+
+The server owns recipe and HTTP authority; storage depends on core, never on
+server or wire DTOs. One ranked relation compares queued retries/preparation
+with pending leads, findings, exact continuations and ordinary coverage.
+Children are created only by the winning claim. Candidate validation, lease,
+assignments, charge, fairness and bounded response serialization share one
+transaction. Classified permanent defects roll back tentative claim effects
+before durable quarantine and bounded reranking; independent maintenance also
+examines work hidden by readiness or worker-capability filters. Unexpected
+database errors propagate.
+
+Bootstrap publishes its immutable profile after sealing the complete tracked
+manifest, before source-backed agent writes. Every attempt confirms its actual
+checkout. Checkpoints are independent and durable; single-entry disposition
+updates do not replace a prior bulk snapshot. Exact continuation holds are
+scheduling reservations, not coverage. Managed coverage uses typed canonical
+evidence, digest/projection agreement, current source/profile, producer/epoch
+ownership and current manifest references through one storage predicate.
+
+Terminal transactions retain their complete typed evidence and a small receipt.
+Promotion creates canonical mandatory verification intent even when admission
+is unavailable. Execution failure, exhausted budgets and missing infrastructure
+never become security verdicts. A newly confirmed transition reports only after
+commit; replay does not redeliver, and existing admin report retry handles the
+commit-before-dispatch gap. Phase reports render accepted prose literally.
+
+The explicit quiescent admin reset discards only an incompatible rebuildable
+generation graph. Findings/evidence/reports, job audit/replay history and
+mandatory verification intent survive. A minimal retired identity stub prevents
+reset-ID reuse within a repository lifetime; later normal bootstrap rebuilds
+coverage. There is no automatic GC or implicit successor re-admission.
 
 Every new mutation accepts a caller-owned `rusqlite::Transaction` and
 returns `storage::Result`. It never begins a nested transaction or commits.
@@ -413,11 +449,12 @@ redacted values, UI isolates bidirectional text, reports escape Markdown,
 and CLI rendering escapes controls. Searching for formatting sites is an
 audit aid, not proof of these guarantees.
 
-The future phase endpoints must enforce HTTP body caps before
-deserialization, validate payload field semantics and job-specific
-budgets, and validate the lease before first finalization. Proof capture,
-finalization, garbage collection, and sink wiring are not implemented by
-this storage layer.
+Phase endpoints cap HTTP bodies before deserialization, validate typed field
+semantics and frozen per-job limits, and recheck authority inside the write
+transaction. They serialize bounded, non-cacheable responses before committing.
+Canonical evidence uses destination-specific payload bounds without relaxing
+generic JSON policies. Proof capture and automatic garbage collection remain
+unimplemented; pre-proof finalization and literal reporting are server-owned.
 
 ## Cross-references
 

@@ -51,7 +51,7 @@ async fn review_scheduler_preserves_legacy_verify_first_through_http() {
 }
 
 #[tokio::test]
-async fn phase_advertisements_do_not_open_public_runtime_gates() {
+async fn phase_advertisements_enable_only_validated_review_work() {
 	use loupe_core::text::policy::Payload;
 	use loupe_core::text::BoundedJson;
 	use loupe_core::JobKind;
@@ -75,14 +75,14 @@ async fn phase_advertisements_do_not_open_public_runtime_gates() {
 		let mut ids=vec![job_id];
 		for kind in [JobKind::Drilldown,JobKind::Verify] {
 			let recipe=BoundedJson::<Payload>::new(&serde_json::json!({"version":1,"phase":kind.as_str()}).to_string())?;
-			// Explicit adversarial queued rows test the closed public gate;
-			// these are not the production V2 first-claim materialization path.
+			// Unsupported child shapes without admission authority must never
+			// lease merely because a worker advertises their phase kind.
 			tx.execute("INSERT INTO jobs(repo_id,kind,state,campaign_id,generation_id,assigned_lead_id,target_finding_id,scheduling_band,effective_priority,eligible_at,recipe,workflow_contract_version,enqueued_at) VALUES(?1,?2,'queued',?3,?4,?5,?6,'urgent',100,?7,?8,1,?7)",rusqlite::params![f.repo_id,kind.as_str(),campaign_id,generation_id,(kind==JobKind::Drilldown).then_some(lead_id),(kind==JobKind::Verify).then_some(finding_id),now,recipe.expose()])?;
 			ids.push(tx.last_insert_rowid());
 		}
 		Ok(ids)
 	})).unwrap();
-	for review_capabilities in [
+	for (index, review_capabilities) in [
 		LeaseList::default(),
 		LeaseList::new(vec![
 			ReviewCapability::Survey,
@@ -90,7 +90,10 @@ async fn phase_advertisements_do_not_open_public_runtime_gates() {
 			ReviewCapability::Verify,
 		])
 		.unwrap(),
-	] {
+	]
+	.into_iter()
+	.enumerate()
+	{
 		let response = f
 			.worker
 			.post("https://loupe-server/v1/jobs/lease")
@@ -104,35 +107,43 @@ async fn phase_advertisements_do_not_open_public_runtime_gates() {
 			.await
 			.unwrap();
 		assert!(response.status().is_success());
-		assert!(matches!(
-			response.json::<LeaseResponse>().await.unwrap(),
-			LeaseResponse::Empty { .. }
-		));
-	}
-	f.db.with_conn(|conn| {
-		for id in ids {
-			let row = loupe_storage::jobs::get(conn, id)?.unwrap();
-			assert_eq!(row.state, JobState::Queued);
-			assert_eq!(row.attempts, 0);
+		let response = response.json::<LeaseResponse>().await.unwrap();
+		if index == 0 {
+			assert!(matches!(response, LeaseResponse::Empty { .. }));
+		} else {
+			let LeaseResponse::Lease(lease) = response else {
+				panic!("valid bootstrap must lease")
+			};
+			assert_eq!(lease.job_id, ids[0]);
 		}
-		assert_eq!(
-			conn.query_row("SELECT seq FROM scheduler_clock", [], |row| row.get::<_, i64>(0))?,
-			0
-		);
-		Ok(())
-	})
-	.unwrap();
+		f.db.with_conn(|conn| {
+			for (position, id) in ids.iter().enumerate() {
+				let row = loupe_storage::jobs::get(conn, *id)?.unwrap();
+				let expected =
+					if index == 1 && position == 0 { JobState::Leased } else { JobState::Queued };
+				assert_eq!(row.state, expected);
+				assert_eq!(row.attempts, u32::from(index == 1 && position == 0));
+			}
+			assert_eq!(
+				conn.query_row("SELECT seq FROM scheduler_clock", [], |row| row.get::<_, i64>(0))?,
+				index as i64,
+				"only the valid phase lease may advance fairness"
+			);
+			Ok(())
+		})
+		.unwrap();
+	}
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	assert_eq!(
 		lease_job(&f.worker).await.job_id,
 		scan.job_id,
-		"closed review gates must preserve legacy progress"
+		"phase admission must preserve legacy progress"
 	);
 	f.handle.shutdown().await;
 }
 
-// Deliberately persisted lease fixture: public claims remain closed. These
-// tests pin the boundary that must still hold once phase claims are enabled.
+// Deliberately persisted lease fixture isolates control and legacy-access
+// boundaries independently of phase evidence admission.
 async fn campaign_verify_fixture() -> (Fixture, LeaseEnvelope, i64) {
 	use loupe_server::review::campaign;
 	use loupe_server::review::policy::ReviewPolicy;

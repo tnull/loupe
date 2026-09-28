@@ -26,13 +26,13 @@ pub fn claim_for_worker(
 	// The route owns this budget across every long-poll wakeup. Only commit
 	// consumes it: an unexpected error rolls back both work and local progress.
 	let mut remaining = *repairs_left;
-	let legacy: Vec<_> = [JobKind::Scan, JobKind::Verify]
-		.into_iter()
+	let legacy: Vec<_> = jobs::LEGACY_RUNTIME_KINDS
+		.iter()
 		.filter(|kind| {
-			jobs::RUNTIME_KINDS.contains(kind)
-				&& (*kind != JobKind::Verify
-					|| request.capabilities.iter().any(|c| c.starts_with("verify:")))
+			**kind != JobKind::Verify
+				|| request.capabilities.iter().any(|c| c.starts_with("verify:"))
 		})
+		.cloned()
 		.collect();
 	let phase: Vec<_> = request
 		.review_capabilities

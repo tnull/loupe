@@ -135,10 +135,9 @@ pub fn cancel_queued_children(
 mod tests;
 pub use crate::review_units::Priority as Band;
 
-/// Campaign job kinds this binary can lease *and finish through the phase
-/// endpoints*. Empty until B4 lands those endpoints; widen it together with
-/// `jobs::RUNTIME_KINDS` and the handlers, never ahead of them.
-pub const PHASE_RUNTIME_KINDS: &[JobKind] = &[];
+/// Campaign kinds supported by the pre-proof review endpoints. Recipe and
+/// evidence eligibility remain the server admission owner's responsibility.
+pub const PHASE_RUNTIME_KINDS: &[JobKind] = &[JobKind::Survey, JobKind::Drilldown, JobKind::Verify];
 
 pub const PRIORITY_MAX: u32 = 1000;
 

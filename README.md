@@ -329,10 +329,11 @@ outside the agent namespace.
 
 Cache size defaults to 40 GB and evicts LRU clones above the cap.
 
-Verifier jobs only get queued when a repo resolves to
+Legacy verifier jobs only get queued when a repo resolves to
 `verification_enabled = true`, either because it was registered with
 `--verification-enabled` or because the server's verification default
-is on.
+is on. Canonical v2 review findings always retain mandatory verification
+intent, independently of that legacy toggle.
 
 #### Deploy with containers
 
@@ -347,8 +348,10 @@ image builds, two-host deployment, restart behaviour, and the exact
 secret-handling model.
 
 For the coordinated HTTP protocol-3 rollout, follow the
-[protocol upgrade runbook](contrib/upgrading-protocol-v3.md). This foundation
-keeps review-phase claims disabled; it does not activate the v2 harness.
+[protocol upgrade runbook](contrib/upgrading-protocol-v3.md). The server exposes
+the pre-proof review API only to explicit phase advertisements. Current workers
+advertise none, and production triggers still use the legacy pipeline; this
+does not activate end-to-end v2 worker execution.
 
 For existing installations, follow the
 [schema-v4 offline upgrade runbook](contrib/upgrading-schema-v4.md) before

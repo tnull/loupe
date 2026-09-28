@@ -1,11 +1,12 @@
-//! One transactional claim for legacy and campaign queues.
+//! Legacy transactional claims. Production review claims are validated and
+//! serialized by the server's review admission owner before commit.
 use loupe_core::text::{BoundedJson, Identifier};
 use loupe_core::JobKind;
 use rusqlite::{named_params, params, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 
-use super::{invalid, CampaignPolicy, ClaimPolicy, PHASE_RUNTIME_KINDS};
-use crate::jobs::{self, JobRow, JOB_COLUMNS, RUNTIME_KINDS};
+use super::{invalid, CampaignPolicy, ClaimPolicy};
+use crate::jobs::{self, JobRow, JOB_COLUMNS, LEGACY_RUNTIME_KINDS};
 use crate::{campaigns, checkpoints, review_units, Entity, Error, Result};
 
 pub struct ClaimRequest<'a> {
@@ -30,17 +31,13 @@ const PROMOTED: &str =
 	"j.campaign_id IS NOT NULL AND j.kind='survey' AND COALESCE(s.burst,0)>=:burst_length";
 const ANTI_AFFINITY: &str = "CASE WHEN j.kind='verify' AND j.campaign_id IS NOT NULL AND EXISTS(SELECT 1 FROM finding_review_details d JOIN jobs p ON p.assigned_lead_id=d.origin_lead_id AND p.kind='drilldown' WHERE d.finding_id=j.target_finding_id AND p.worker_id=:worker) THEN 1 ELSE 0 END";
 
-/// Runtime gating is mandatory, even when callers request unsupported kinds.
-/// Legacy rows follow `RUNTIME_KINDS`; campaign rows additionally need a
-/// phase handler for their kind (`PHASE_RUNTIME_KINDS`), because `verify`
-/// is a runtime kind for the legacy pipeline long before the phase
-/// endpoints exist.
+/// This legacy entry point never claims campaign work. Review claims must use
+/// the server owner that validates and serializes the full envelope in the same
+/// transaction as admission; widening runtime support cannot bypass that owner.
 pub fn claim(tx: &Transaction<'_>, req: &ClaimRequest<'_>) -> Result<Option<Claimed>> {
 	let kinds: Vec<_> =
-		req.kinds.iter().filter(|kind| RUNTIME_KINDS.contains(kind)).cloned().collect();
-	let campaign_kinds: Vec<_> =
-		kinds.iter().filter(|kind| PHASE_RUNTIME_KINDS.contains(kind)).cloned().collect();
-	claim_filtered(tx, req, &kinds, &campaign_kinds)
+		req.kinds.iter().filter(|kind| LEGACY_RUNTIME_KINDS.contains(kind)).cloned().collect();
+	claim_filtered(tx, req, &kinds, &[])
 }
 
 /// Kept inside this module's parent so phase logic can be tested before B4.

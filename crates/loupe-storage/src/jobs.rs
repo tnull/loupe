@@ -43,12 +43,17 @@ pub fn targets_phase_finding(conn: &Connection, job: i64) -> rusqlite::Result<bo
 	)
 }
 
-/// Widen only when the runtime can authorize and finish the added kinds.
-pub const RUNTIME_KINDS: &[JobKind] = &[JobKind::Scan, JobKind::Verify];
+/// Job kinds supported by this binary. Phase claims still require explicit
+/// review capabilities and the transactional review admission owner.
+pub const RUNTIME_KINDS: &[JobKind] =
+	&[JobKind::Scan, JobKind::Survey, JobKind::Drilldown, JobKind::Verify];
 
-fn runtime_kinds_sql() -> &'static str {
+/// Only these kinds may enter legacy enqueue, lease, or control paths.
+pub const LEGACY_RUNTIME_KINDS: &[JobKind] = &[JobKind::Scan, JobKind::Verify];
+
+fn legacy_kinds_sql() -> &'static str {
 	static SQL: LazyLock<String> = LazyLock::new(|| {
-		RUNTIME_KINDS
+		LEGACY_RUNTIME_KINDS
 			.iter()
 			.map(|kind| format!("'{}'", kind.as_str()))
 			.collect::<Vec<_>>()
@@ -140,7 +145,7 @@ pub enum RetryOutcome {
 pub fn enqueue(conn: &Connection, new: &NewJob, now: i64) -> crate::Result<i64> {
 	// NewJob is also the public legacy input, so enforce this at runtime.
 	// Match the enum, not its text: Unknown("scan") is still unknown.
-	if !RUNTIME_KINDS.contains(&new.kind) {
+	if !LEGACY_RUNTIME_KINDS.contains(&new.kind) {
 		return Err(
 			loupe_core::text::Error::new("job_kind", loupe_core::text::Rule::Identifier).into()
 		);
@@ -184,7 +189,7 @@ pub fn heartbeat(
 		   AND job_capability_hash = ?5
 		   AND lease_expires_at >= ?6
 		   AND kind IN ({})",
-			runtime_kinds_sql()
+			legacy_kinds_sql()
 		),
 		params![lease_until, job_id, leased_state.as_str(), worker_id, job_capability_hash, now],
 	)?;
@@ -221,7 +226,7 @@ pub fn complete(
 		   AND job_capability_hash = ?8
 		   AND lease_expires_at >= ?9
 		   AND kind IN ({})",
-			runtime_kinds_sql()
+			legacy_kinds_sql()
 		),
 		params![
 			target_state.as_str(),
@@ -244,7 +249,7 @@ pub fn complete(
 pub fn cancel(conn: &mut Connection, job_id: i64, now: i64) -> rusqlite::Result<CancelOutcome> {
 	let tx = conn.transaction()?;
 	let Some(row) = get(&tx, job_id)? else { return Ok(CancelOutcome::NotFound) };
-	if !RUNTIME_KINDS.contains(&row.kind) {
+	if !LEGACY_RUNTIME_KINDS.contains(&row.kind) {
 		return Ok(CancelOutcome::UnsupportedKind);
 	}
 	let target_state = match row.state.apply(JobTransition::Cancel) {
@@ -262,7 +267,7 @@ pub fn cancel(conn: &mut Connection, job_id: i64, now: i64) -> rusqlite::Result<
 		       finished_at = ?3,
 		       error = ?4
 		 WHERE id = ?1 AND state IN ('queued','leased') AND kind IN ({})",
-			runtime_kinds_sql()
+			legacy_kinds_sql()
 		),
 		(job_id, target_state.as_str(), now, JOB_CANCELLED_BY_ADMIN_ERROR),
 	)?;
@@ -313,7 +318,7 @@ pub fn retry_failed(
 		return Ok(RetryOutcome::Conflict("phase work requires typed recovery; legacy retry cannot reset its frozen attempt budget".into()));
 	}
 	let Some(row) = get(&tx, job_id)? else { return Ok(RetryOutcome::NotFound) };
-	if !RUNTIME_KINDS.contains(&row.kind) {
+	if !LEGACY_RUNTIME_KINDS.contains(&row.kind) {
 		return Ok(RetryOutcome::UnsupportedKind);
 	}
 	if row.state != JobState::Failed {
@@ -402,7 +407,7 @@ pub fn requeue_failed(
 		       enqueued_at = ?2
 		 WHERE id = ?3 AND state = ?4
 		   AND kind IN ({})",
-			runtime_kinds_sql()
+			legacy_kinds_sql()
 		),
 		(target_state.as_str(), now, job_id, JobState::Failed.as_str()),
 	)?;
@@ -451,7 +456,7 @@ pub fn get_active_by_capability_hash(
 			   AND lease_expires_at >= ?3
 			   AND campaign_id IS NULL
 			   AND kind IN ({runtime})",
-			runtime = runtime_kinds_sql(),
+			runtime = legacy_kinds_sql(),
 		),
 		params![worker_id, job_capability_hash, now],
 		row_to_job,
@@ -554,7 +559,7 @@ pub fn worker_has_active_lease_for_repo(
 		       AND lease_expires_at >= ?3
 		       AND kind IN ({})
 		 )",
-			runtime_kinds_sql()
+			legacy_kinds_sql()
 		),
 		params![repo_id, worker_id, now],
 		|r| r.get(0),
@@ -652,7 +657,7 @@ fn reap_legacy(conn: &Transaction<'_>, now: i64) -> crate::Result<usize> {
 		   AND attempts < ?3
 		   AND campaign_id IS NULL
 		   AND kind IN ({})",
-			runtime_kinds_sql()
+			legacy_kinds_sql()
 		),
 		params![now, requeued_state.as_str(), MAX_ATTEMPTS],
 	)?;
@@ -670,7 +675,7 @@ fn reap_legacy(conn: &Transaction<'_>, now: i64) -> crate::Result<usize> {
 		   AND attempts >= ?2
 		   AND campaign_id IS NULL
 		   AND kind IN ({})",
-			runtime_kinds_sql()
+			legacy_kinds_sql()
 		),
 		params![now, MAX_ATTEMPTS, failed_state.as_str(), LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR],
 	)?;

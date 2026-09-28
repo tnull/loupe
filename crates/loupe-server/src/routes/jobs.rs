@@ -655,7 +655,7 @@ pub async fn complete(
 	let authorized = job_capability::authorize_for_job(&state, &worker, &headers, job_id, now)?;
 	let job = &authorized.row;
 	// Same set the storage guards use; the two must never drift apart.
-	if !jobs::RUNTIME_KINDS.contains(&job.kind) {
+	if !jobs::LEGACY_RUNTIME_KINDS.contains(&job.kind) {
 		return Err((StatusCode::BAD_REQUEST, "unsupported job kind".into()));
 	}
 	if matches!(new_state, JobState::Succeeded) {

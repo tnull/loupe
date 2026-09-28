@@ -1,5 +1,5 @@
 //! These are direct leased authorization-boundary fixtures, not claims about
-//! public phase lifecycle support. Public runtime gates remain closed.
+//! public phase lifecycle support; real-router flows live in review_public.rs.
 use loupe_core::review_payload::{GeneratedProfile, SurveyTerminalV1};
 use loupe_core::text::{BoundedJson, BoundedText, Identifier};
 use loupe_storage::secrets::MasterKey;

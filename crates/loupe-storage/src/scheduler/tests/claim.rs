@@ -60,7 +60,7 @@ fn units(db: &crate::Db) {
 }
 
 #[test]
-fn public_claim_keeps_survey_and_drilldown_runtime_gated() {
+fn legacy_claim_never_offers_survey_or_drilldown() {
 	let db = claim_fixture();
 	let id = queue(&db, Band::Normal, 0, 0);
 	db.with_conn(|conn| {
@@ -506,9 +506,8 @@ fn legacy_claim_order_matches_recorded_base_sequence() {
 
 #[test]
 fn public_claim_never_offers_campaign_rows_to_legacy_kinds() {
-	// `verify` is a runtime kind for the legacy pipeline, but a campaign
-	// verify job needs B4's phase handlers; until then a protocol-2 worker
-	// advertising `verify:*` must never receive one.
+	// The legacy storage entry point cannot bypass the server's validated
+	// phase admission, even though both pipelines support the verify kind.
 	let db = claim_fixture();
 	let verify = db
 		.with_conn(|conn| {

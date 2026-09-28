@@ -7,9 +7,8 @@
 //! and rerank after each durable quarantine; a returned page is not an allocation
 //! plan. No source is prelimitted before the final global ordering.
 //!
-//! Ordinary coverage currently shares `UNIT_NEEDS_WORK`'s historical-evidence
-//! rules. Compatibility regeneration must join that predicate before activation.
-//! Bounded maintenance with all enabled phase kinds must also validate/quarantine
+//! Ordinary coverage shares `UNIT_NEEDS_WORK`'s current typed-evidence rules.
+//! Bounded independent maintenance also validates and quarantines
 //! rows independently of worker advertisements: scalar eligibility cannot prove
 //! a retained payload or policy digest valid.
 use loupe_core::JobKind;

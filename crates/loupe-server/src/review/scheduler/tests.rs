@@ -1,4 +1,5 @@
-//! New consumer feature tests use explicit phase kinds while public gates remain closed.
+//! Admission consumer tests select explicit phase kinds; public capability
+//! negotiation is covered separately through the real router.
 use loupe_core::review_payload::{GeneratedProfile, LeadEvidenceV1, UnitResultPayloadV1};
 use loupe_storage::admission_policy::{AcceptedPriority, CampaignPolicyV2};
 use loupe_storage::{admission, leads, review_intents, transaction, unit_holds, Db};
