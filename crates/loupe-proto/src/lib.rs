@@ -13,6 +13,7 @@ mod registry;
 pub mod review_api;
 pub mod review_inventory;
 pub mod review_lease;
+pub mod review_terminal;
 pub mod review_units;
 mod scan;
 mod version;

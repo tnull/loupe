@@ -5,3 +5,4 @@ pub mod envelope;
 pub mod http;
 pub mod policy;
 pub mod scheduler;
+pub mod terminal;

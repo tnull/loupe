@@ -61,6 +61,7 @@ pub fn router(state: AppState) -> Router {
 		.route("/v1/jobs/{id}/publish-profile", post(routes::review_host::publish_profile))
 		.route("/v1/jobs/{id}/inventory-dispositions", post(routes::review_inventory::submit))
 		.route("/v1/jobs/{id}/review-units", post(routes::review_units::submit))
+		.route("/v1/jobs/{id}/finalize-survey", post(routes::review_survey::finalize))
 		.route("/v1/jobs/{id}/limits", get(routes::review_context::limits))
 		.route("/v1/jobs/{id}/lead-candidates", get(routes::review_context::candidates))
 		.route_layer(axum::middleware::from_fn(auth::require_worker));

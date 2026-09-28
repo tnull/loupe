@@ -192,8 +192,75 @@ fn complete_empty_batch(tx: &Transaction<'_>, batch: i64) -> Result<()> {
 	Ok(())
 }
 
-/// Freeze only the just-finished producer's current holds. No new work can be
-/// appended to an already-frozen producer, even if old members later resolve.
+/// A handoff producer owns scheduling, not necessarily the retained evidence.
+/// Carried holds retain their original result/source epoch; only an immutable
+/// exact assignment permits deriving a later handoff epoch.
+fn incoming_batch(tx: &Transaction<'_>, p: &review_intents::JobContext) -> Result<Option<Batch>> {
+	let id = tx
+		.query_row(
+			"SELECT batch_id FROM survey_continuation_batches WHERE admitted_job_id=?1",
+			[p.job.id],
+			|r| r.get(0),
+		)
+		.optional()?;
+	let Some(id) = id else { return Ok(None) };
+	let batch = get_batch(tx, id)?.ok_or(Error::Conflict(Conflict::Assignment))?;
+	let assigned = assigned_units(tx, p.job.id)?;
+	if !matches!(batch.state, State::Admitted | State::Complete)
+		|| batch.repo_id != p.job.repo_id
+		|| batch.generation_id != p.generation
+		|| batch.campaign_id != p.campaign
+		|| p.job.parent_job_id != Some(batch.producer_job_id)
+		|| p.job.continuation_of_job_id != Some(batch.producer_job_id)
+		|| assigned.len() != batch.expected_unit_count as usize
+		|| assigned.iter().enumerate().any(|(index, a)| a.position != index as i64)
+	{
+		return Err(Error::Conflict(Conflict::Assignment));
+	}
+	Ok(Some(batch))
+}
+
+fn handoff_epoch(
+	tx: &Transaction<'_>, h: &Hold, p: &review_intents::JobContext, incoming: Option<&Batch>,
+) -> Result<i64> {
+	if h.producing_job_id == p.job.id {
+		return Ok(h.source_assignment_epoch);
+	}
+	let batch = incoming.ok_or(Error::Conflict(Conflict::Assignment))?;
+	// Positions compact when resolved siblings disappear. Membership comes
+	// from the original assignment, never equality to a new batch position.
+	let epoch:Option<i64>=tx.query_row("SELECT assignment_epoch FROM job_assigned_review_units WHERE job_id=?1 AND review_unit_id=?2 AND completed=0 AND position>=0 AND position<?3",params![p.job.id,h.unit_id,batch.expected_unit_count],|r|r.get(0)).optional()?;
+	epoch.ok_or(Error::Conflict(Conflict::Assignment))
+}
+
+fn validate_held_source(
+	tx: &Transaction<'_>, h: &Hold, p: &review_intents::JobContext, epoch: i64,
+) -> Result<()> {
+	validate_evidence(
+		tx,
+		h.producing_result_id,
+		h.unit_id,
+		h.source_assignment_epoch,
+		Some(h.continuation_class),
+	)?;
+	let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM review_units u JOIN review_unit_results r ON r.review_unit_id=u.review_unit_id JOIN jobs j ON j.id=r.produced_by_job_id
+		WHERE u.review_unit_id=?1 AND u.generation_id=?2 AND u.assignment_epoch=?3 AND u.assignment_epoch<9223372036854775807
+		AND u.status IN('open','deferred') AND u.stale=0 AND r.review_unit_result_id=?4 AND r.produced_by_job_id=?5
+		AND j.kind='survey' AND j.generation_id=u.generation_id AND j.repo_id=?8 AND j.head_sha=?6 AND j.workflow_contract_version=1
+		AND ((u.created_by_job_id=j.id AND ?9=0) OR EXISTS(SELECT 1 FROM job_assigned_review_units a WHERE a.job_id=j.id AND a.review_unit_id=u.review_unit_id AND a.assignment_epoch=?9))
+		AND r.invalidated=0 AND r.disposition='needs_follow_up' AND r.commit_sha=?6 AND r.profile_version=?7
+		AND r.corroborates_review_unit_result_id IS NULL AND r.corroborates_inventory_exclusion_id IS NULL
+		AND NOT EXISTS(SELECT 1 FROM job_assigned_review_units a JOIN jobs live ON live.id=a.job_id WHERE a.review_unit_id=u.review_unit_id AND live.state IN('queued','leased')))",
+		params![h.unit_id,p.generation,epoch,h.producing_result_id,h.producing_job_id,p.sha,p.profile_version,p.job.repo_id,h.source_assignment_epoch],|r|r.get(0))?;
+	if !valid || h.generation_id != p.generation {
+		return Err(Error::Conflict(Conflict::Assignment));
+	}
+	Ok(())
+}
+
+/// Freeze new evidence and untouched members of this producer's exact incoming
+/// reservation. Original evidence provenance survives every logical handoff.
+/// No work can be appended to an already-frozen producer.
 pub fn freeze_survey_batches(
 	tx: &Transaction<'_>, producer_job: i64, now: i64,
 ) -> Result<Vec<Batch>> {
@@ -210,13 +277,25 @@ pub fn freeze_survey_batches(
 		return Ok(existing);
 	}
 	let policy = &p.policy;
-	let previous: Option<i64> = tx
-		.query_row(
-			"SELECT logical_sequence FROM survey_continuation_batches WHERE admitted_job_id=?1",
-			[producer_job],
-			|r| r.get(0),
-		)
-		.optional()?;
+	let incoming = incoming_batch(tx, &p)?;
+	if let Some(batch) = &incoming {
+		for assignment in assigned_units(tx, producer_job)? {
+			let hold = get_hold(tx, assignment.unit_id)?;
+			if !assignment.completed {
+				let hold = hold.ok_or(Error::Conflict(Conflict::Assignment))?;
+				if batch.state != State::Admitted
+					|| hold.pending_batch_id != Some(batch.batch_id)
+					|| hold.batch_position != Some(assignment.position)
+				{
+					return Err(Error::Conflict(Conflict::Assignment));
+				}
+			} else if hold.is_some_and(|h| h.pending_batch_id == Some(batch.batch_id)) {
+				return Err(Error::Conflict(Conflict::Assignment));
+			}
+		}
+	}
+	let incoming_id = incoming.as_ref().filter(|b| b.state == State::Admitted).map(|b| b.batch_id);
+	let previous = incoming.as_ref().map(|b| b.logical_sequence);
 	let sequence =
 		previous.unwrap_or(0).checked_add(1).ok_or(Error::Conflict(Conflict::Assignment))?;
 	let mut batches = Vec::new();
@@ -227,13 +306,13 @@ pub fn freeze_survey_batches(
 		ContinuationClass::RequiresSuccessor,
 	] {
 		loop {
-			let members:Vec<(i64,i64,review_units::Priority)>=tx.prepare("SELECT h.review_unit_id,h.source_assignment_epoch,u.priority_band FROM review_unit_holds h JOIN review_units u ON u.review_unit_id=h.review_unit_id LEFT JOIN job_assigned_review_units a ON a.job_id=h.producing_job_id AND a.review_unit_id=h.review_unit_id WHERE h.producing_job_id=?1 AND h.pending_batch_id IS NULL AND h.continuation_class=?2 ORDER BY COALESCE(a.position,u.review_unit_id),u.review_unit_id LIMIT ?3")?.query_map(params![producer_job,class_str(class),policy.survey_units_per_job],|r|Ok((r.get(0)?,r.get(1)?,parsed(r,2)?)))?.collect::<rusqlite::Result<_>>()?;
+			let members:Vec<(i64,review_units::Priority)>=tx.prepare("SELECT h.review_unit_id,u.priority_band FROM review_unit_holds h JOIN review_units u ON u.review_unit_id=h.review_unit_id LEFT JOIN job_assigned_review_units a ON a.job_id=?1 AND a.review_unit_id=h.review_unit_id WHERE ((h.producing_job_id=?1 AND h.pending_batch_id IS NULL) OR h.pending_batch_id=?4) AND h.continuation_class=?2 ORDER BY COALESCE(a.position,u.review_unit_id),u.review_unit_id LIMIT ?3")?.query_map(params![producer_job,class_str(class),policy.survey_units_per_job,incoming_id],|r|Ok((r.get(0)?,parsed(r,1)?)))?.collect::<rusqlite::Result<_>>()?;
 			if members.is_empty() {
 				break;
 			}
 			let band = members
 				.iter()
-				.map(|m| m.2)
+				.map(|m| m.1)
 				.min_by_key(|b| match b {
 					review_units::Priority::Urgent => 0,
 					review_units::Priority::High => 1,
@@ -244,11 +323,29 @@ pub fn freeze_survey_batches(
 			let (state, not_before, reason) = continuation_state(policy, class, sequence, now)?;
 			tx.execute("INSERT INTO survey_continuation_batches(repo_id,generation_id,campaign_id,producer_job_id,batch_ordinal,logical_sequence,continuation_class,state,not_before,block_reason,expected_unit_count,accepted_band,accepted_score,priority_policy_version,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0,1,?13)",params![p.job.repo_id,p.generation,p.campaign,producer_job,batches.len() as i64,sequence,class_str(class),state.as_str(),not_before,reason.map(BlockReason::as_str),members.len() as i64,band.as_str(),now])?;
 			let batch = tx.last_insert_rowid();
-			for (position, (unit, epoch, _)) in members.iter().enumerate() {
-				changed(tx.execute("UPDATE review_unit_holds SET pending_batch_id=?2,batch_position=?3,updated_at=?4 WHERE review_unit_id=?1 AND pending_batch_id IS NULL AND generation_id=?5 AND producing_job_id=?6 AND source_assignment_epoch=?7",params![unit,batch,position as i64,now,p.generation,producer_job,epoch])?,Conflict::Assignment)?;
+			for (position, (unit, _)) in members.iter().enumerate() {
+				let hold = get_hold(tx, *unit)?.ok_or(Error::Conflict(Conflict::Assignment))?;
+				let epoch = handoff_epoch(tx, &hold, &p, incoming.as_ref())?;
+				validate_held_source(tx, &hold, &p, epoch)?;
+				if let Some(old) = hold.pending_batch_id {
+					let assignment = assigned_units(tx, p.job.id)?
+						.into_iter()
+						.find(|a| a.unit_id == *unit)
+						.ok_or(Error::Conflict(Conflict::Assignment))?;
+					if Some(old) != incoming_id
+						|| hold.batch_position != Some(assignment.position)
+						|| assignment.completed
+					{
+						return Err(Error::Conflict(Conflict::Assignment));
+					}
+				}
+				changed(tx.execute("UPDATE review_unit_holds SET pending_batch_id=?2,batch_position=?3,updated_at=?4 WHERE review_unit_id=?1 AND generation_id=?5 AND ((producing_job_id=?6 AND pending_batch_id IS NULL) OR pending_batch_id=?7)",params![unit,batch,position as i64,now,p.generation,producer_job,incoming_id])?,Conflict::Assignment)?;
 			}
 			batches.push(get_batch(tx, batch)?.ok_or(Error::Conflict(Conflict::Assignment))?);
 		}
+	}
+	if let Some(old) = incoming_id {
+		complete_empty_batch(tx, old)?;
 	}
 	Ok(batches)
 }
@@ -304,30 +401,27 @@ pub fn admit_exact_batch(
 	if holds.len() != batch.expected_unit_count as usize {
 		return Err(Error::Conflict(Conflict::Assignment));
 	}
+	let producer = review_intents::producer(tx, batch.producer_job_id)?;
+	if producer.job.state != JobState::Succeeded {
+		return Err(Error::Conflict(Conflict::Assignment));
+	}
+	let incoming = incoming_batch(tx, &producer)?;
+	let mut epochs = Vec::with_capacity(holds.len());
 	for (position, h) in holds.iter().enumerate() {
 		if h.batch_position != Some(position as i64)
 			|| h.generation_id != batch.generation_id
-			|| h.producing_job_id != batch.producer_job_id
 			|| h.continuation_class != batch.continuation_class
 			|| h.block_reason.is_some()
 		{
 			return Err(Error::Conflict(Conflict::Assignment));
 		}
-		validate_evidence(
-			tx,
-			h.producing_result_id,
-			h.unit_id,
-			h.source_assignment_epoch,
-			Some(h.continuation_class),
-		)?;
-		let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM review_units u JOIN review_unit_results r ON r.review_unit_id=u.review_unit_id WHERE u.review_unit_id=?1 AND u.generation_id=?2 AND u.assignment_epoch=?3 AND u.assignment_epoch<9223372036854775807 AND u.status IN('open','deferred') AND u.stale=0 AND r.review_unit_result_id=?4 AND r.produced_by_job_id=?5 AND r.invalidated=0 AND r.disposition='needs_follow_up' AND r.commit_sha=?6 AND r.profile_version=?7 AND r.corroborates_review_unit_result_id IS NULL AND r.corroborates_inventory_exclusion_id IS NULL AND NOT EXISTS(SELECT 1 FROM job_assigned_review_units a JOIN jobs j ON j.id=a.job_id WHERE a.review_unit_id=u.review_unit_id AND j.state IN('queued','leased')))",params![h.unit_id,p.generation,h.source_assignment_epoch,h.producing_result_id,h.producing_job_id,p.sha,p.profile_version],|r|r.get(0))?;
-		if !valid {
-			return Err(Error::Conflict(Conflict::Assignment));
-		}
+		let epoch = handoff_epoch(tx, h, &producer, incoming.as_ref())?;
+		validate_held_source(tx, h, &p, epoch)?;
+		epochs.push(epoch);
 	}
 	changed(tx.execute("UPDATE survey_continuation_batches SET state='admitted',admitted_job_id=?2 WHERE batch_id=?1 AND state='pending' AND admitted_job_id IS NULL",params![batch_id,child_job])?,Conflict::Assignment)?;
-	for h in &holds {
-		changed(tx.execute("UPDATE review_units SET status='open',defer_reason=NULL,assignment_epoch=assignment_epoch+1 WHERE review_unit_id=?1 AND assignment_epoch=?2",params![h.unit_id,h.source_assignment_epoch])?,Conflict::Assignment)?;
+	for (h, epoch) in holds.iter().zip(epochs) {
+		changed(tx.execute("UPDATE review_units SET status='open',defer_reason=NULL,assignment_epoch=assignment_epoch+1 WHERE review_unit_id=?1 AND assignment_epoch=?2",params![h.unit_id,epoch])?,Conflict::Assignment)?;
 		tx.execute("INSERT INTO job_assigned_review_units(job_id,review_unit_id,position,assignment_epoch) SELECT ?1,review_unit_id,?3,assignment_epoch FROM review_units WHERE review_unit_id=?2",params![child_job,h.unit_id,h.batch_position])?;
 	}
 	assigned_units(tx, child_job)
