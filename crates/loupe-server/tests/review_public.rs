@@ -513,3 +513,121 @@ async fn public_ranking_promotes_late_urgent_lead_without_spending_protected_bud
 	assert_eq!(scalar(&f, "SELECT COUNT(*) FROM review_campaigns WHERE state='active'"), 0);
 	assert_eq!(scalar(&f, "SELECT COUNT(*) FROM lead_drilldown_intents WHERE state='blocked'"), 1);
 }
+
+async fn profile_version_domain_case(version: rusqlite::types::Value, permitted: bool) {
+	let f = memory(ReviewPolicy::default());
+	let survey = bootstrap(&f).await;
+	let accepted = unit(&f, &survey, "accepted-before-profile-change").await;
+	post(&f, 0, &survey, "review-unit-results", result("accepted", accepted, 0, &[])).await;
+	post(
+		&f,
+		0,
+		&survey,
+		"inventory-dispositions",
+		json!({"protocol_version":3,
+		"client_inventory_disposition_key":"accepted-map","source_path":"z.rs","expected_revision":0,
+		"disposition":"mapped","mappings":[{"review_unit_id":accepted,"assignment_epoch":0}]}),
+	)
+	.await;
+	let evidence = || {
+		f.state
+			.db
+			.with_conn(|conn| {
+				Ok(conn.query_row(
+					"SELECT result_payload,result_digest FROM review_unit_results",
+					[],
+					|row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+				)?)
+			})
+			.unwrap()
+	};
+	let original_evidence = evidence();
+	let before_units = scalar(&f, "SELECT COUNT(*) FROM review_units");
+	let before_checkpoints = scalar(&f, "SELECT COUNT(*) FROM job_checkpoints");
+	// All preparation and prior evidence went through the public API. Only
+	// the profile version is injected to exercise its persisted numeric boundary.
+	f.state.db.with_conn(|conn| {
+		assert_eq!(conn.execute(
+			"UPDATE review_generations SET profile_version=?1 WHERE generation_id=(SELECT generation_id FROM jobs WHERE id=?2)",
+			rusqlite::params![version,survey.job_id],
+		)?,1);
+		Ok(())
+	}).unwrap();
+	let mut replies = Vec::new();
+	for (route, payload) in [
+		(
+			"review-units",
+			json!({"protocol_version":3,"client_review_unit_key":"fresh-after-profile-change",
+			"title":"Fresh boundary","objective":"Inspect another caller","priority_band":"normal",
+			"source_refs":[{"path":"z.rs"}],"depends_on_review_unit_ids":[],"closure_criteria":"Account for callers"}),
+		),
+		(
+			"inventory-dispositions",
+			json!({"protocol_version":3,
+			"client_inventory_disposition_key":"fresh-disposition","source_path":"z.rs","expected_revision":1,
+			"disposition":"context","reason":"Reviewed context","mappings":[]}),
+		),
+	] {
+		replies.push(
+			call(
+				&f,
+				0,
+				&format!("/v1/jobs/{}/{route}", survey.job_id),
+				Some(survey.job_capability.expose_secret()),
+				payload,
+			)
+			.await,
+		);
+	}
+	let after_domain = (
+		scalar(&f, "SELECT COUNT(*) FROM review_units"),
+		scalar(&f, "SELECT COUNT(*) FROM job_checkpoints"),
+		scalar(&f, "SELECT disposition_revision FROM generation_inventory"),
+		scalar(&f, "SELECT COUNT(*) FROM generation_inventory_units"),
+	);
+	// Broken domain readiness must not take away live execution control.
+	post(&f, 0, &survey, "heartbeat", json!({"protocol_version":3})).await;
+	let failure = post(
+		&f,
+		0,
+		&survey,
+		"complete",
+		json!({"protocol_version":3,"outcome":"failed","error":"Execution interrupted"}),
+	)
+	.await;
+	assert_eq!(failure["job_id"], survey.job_id);
+	assert_eq!(failure["state"], "queued");
+	assert_eq!(
+		evidence(),
+		original_evidence,
+		"prior accepted evidence must survive profile corruption and execution failure"
+	);
+	let expected = if permitted { StatusCode::OK } else { StatusCode::FORBIDDEN };
+	assert_eq!(
+		replies.iter().map(|reply|reply.0).collect::<Vec<_>>(),vec![expected;2],
+		"profile version {version:?}: fresh unit and inventory writes must enforce the same readiness boundary; replies={replies:?}"
+	);
+	assert_eq!(after_domain, if permitted {
+		(before_units+1,before_checkpoints+2,2,0)
+	} else {
+		(before_units,before_checkpoints,1,1)
+	},"denied domain writes must not consume checkpoints, create units, or replace accepted mappings");
+}
+
+#[tokio::test]
+async fn public_profile_version_integer_boundaries_allow_fresh_domain_writes() {
+	for version in [1, i64::from(u32::MAX)] {
+		profile_version_domain_case(rusqlite::types::Value::Integer(version), true).await;
+	}
+}
+
+#[tokio::test]
+async fn public_profile_version_above_u32_denies_fresh_domain_writes_but_keeps_control() {
+	profile_version_domain_case(rusqlite::types::Value::Integer(i64::from(u32::MAX) + 1), false)
+		.await;
+}
+
+#[tokio::test]
+async fn public_profile_version_real_denies_fresh_domain_writes_but_keeps_control() {
+	profile_version_domain_case(rusqlite::types::Value::Real(1.5), false).await;
+}
