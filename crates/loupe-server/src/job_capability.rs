@@ -8,6 +8,8 @@ use rand_core::{OsRng, RngCore};
 use crate::auth::AuthedWorker;
 use crate::state::AppState;
 
+/// Legacy job authorization. Review phases use their own transaction-bound
+/// authority, including recipe, preparation and assigned-subject checks.
 pub(crate) struct AuthorizedJob {
 	pub row: JobRow,
 	pub capability_hash: [u8; 32],
@@ -35,15 +37,21 @@ pub(crate) fn issue() -> (JobCapability, [u8; 32]) {
 	(JobCapability::from_secret(token), hash)
 }
 
-pub(crate) fn authorize(
-	state: &AppState, worker: &AuthedWorker, headers: &HeaderMap, now: i64,
-) -> Result<AuthorizedJob, (StatusCode, String)> {
+/// Parsing deliberately does not require a live lease: a terminal retry's
+/// capability has been revoked and must instead authenticate its receipt.
+pub(crate) fn parse_hash(headers: &HeaderMap) -> Result<[u8; 32], (StatusCode, String)> {
 	let token = headers
 		.get(JOB_CAPABILITY_HEADER)
 		.and_then(|value| value.to_str().ok())
 		.filter(|value| value.len() == JOB_CAPABILITY_TOKEN_CHARS)
 		.ok_or_else(forbidden)?;
-	let capability_hash = *blake3::hash(token.as_bytes()).as_bytes();
+	Ok(*blake3::hash(token.as_bytes()).as_bytes())
+}
+
+pub(crate) fn authorize(
+	state: &AppState, worker: &AuthedWorker, headers: &HeaderMap, now: i64,
+) -> Result<AuthorizedJob, (StatusCode, String)> {
+	let capability_hash = parse_hash(headers)?;
 	let row = state
 		.db
 		.with_conn(|conn| {
@@ -79,7 +87,18 @@ mod tests {
 		// `authorize` rejects anything of a different length before it
 		// hashes, so widening the random token without widening the
 		// filter would reject every capability the server just issued.
-		let (token, _) = issue();
+		let (token, expected_hash) = issue();
 		assert_eq!(token.expose_secret().len(), JOB_CAPABILITY_TOKEN_CHARS);
+		let mut headers = HeaderMap::new();
+		headers.insert(JOB_CAPABILITY_HEADER, token.expose_secret().parse().unwrap());
+		assert_eq!(parse_hash(&headers).unwrap(), expected_hash);
+	}
+
+	#[test]
+	fn absent_and_wrong_length_capabilities_share_the_denial() {
+		let mut headers = HeaderMap::new();
+		assert_eq!(parse_hash(&headers).unwrap_err(), forbidden());
+		headers.insert(JOB_CAPABILITY_HEADER, "short".parse().unwrap());
+		assert_eq!(parse_hash(&headers).unwrap_err(), forbidden());
 	}
 }

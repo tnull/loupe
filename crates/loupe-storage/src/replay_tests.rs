@@ -3,6 +3,49 @@ use loupe_core::text::{Anchor, BoundedJson, Identifier};
 
 use crate::review_tests::{fixture, payload, reason};
 use crate::{checkpoints as c, terminal_receipt as t, transaction, Conflict, Error};
+fn replay(
+	tx: &rusqlite::Transaction<'_>, job: i64, cap: &[u8; 32], digest: &[u8; 32],
+) -> crate::Result<t::Replayed> {
+	t::replay_terminal(
+		tx,
+		crate::jobs::LeaseIdentity { job_id: job, worker_id: 1, capability_hash: cap },
+		loupe_core::JobKind::Survey,
+		digest,
+	)
+}
+#[test]
+fn terminal_replay_requires_a_retained_finishing_worker() {
+	let db = fixture();
+	db.with_conn(|conn| {
+		transaction::immediate(conn, |tx| {
+			tx.execute("INSERT INTO workers VALUES(1,'worker','worker',x'01',0,0,NULL)", [])?;
+			tx.execute("UPDATE jobs SET state='succeeded' WHERE id=101", [])?;
+			t::insert(
+				tx,
+				&t::NewReceipt {
+					job_id: 101,
+					phase: loupe_core::JobKind::Survey,
+					terminal_reason: &reason(),
+					subject_title: None,
+					subject_digest: None,
+					pinned_commit_sha: "base",
+					effective_recipe: &payload(),
+					result_digest: &[2; 32],
+					evidence_rung: None,
+					result_counts: None,
+					finishing_capability_hash: Some(&[1; 32]),
+				},
+				1,
+			)?;
+			assert!(
+				matches!(replay(tx, 101, &[1; 32], &[2; 32])?, t::Replayed::Reject(_)),
+				"a receipt without its retained finishing worker must not authenticate replay"
+			);
+			Ok(())
+		})
+	})
+	.unwrap();
+}
 #[test]
 fn checkpoint_run_owns_the_replay_sequence() {
 	// `run` is the API handlers are meant to use: the body never executes on a
@@ -98,7 +141,7 @@ fn lease_transaction_composes_checkpoints_and_typed_failures() {
 	use crate::jobs::{self, ActiveLease, LeaseIdentity};
 	let db = fixture();
 	db.with_conn(|conn|{
-  conn.execute_batch("INSERT INTO workers VALUES(1,'worker','worker',x'01',0,0,NULL); UPDATE jobs SET kind='scan',state='leased',worker_id=1,lease_expires_at=10,job_capability_hash=zeroblob(32) WHERE id=101;")?;
+  conn.execute_batch("INSERT INTO workers VALUES(1,'worker','worker',x'01',0,0,NULL); UPDATE jobs SET kind='scan',campaign_id=NULL,generation_id=NULL,state='leased',worker_id=1,lease_expires_at=10,job_capability_hash=zeroblob(32) WHERE id=101;")?;
   let lease=ActiveLease{identity:LeaseIdentity{job_id:101,worker_id:1,capability_hash:&[0;32]},now:5};
   let key=Identifier::new("typed-transaction").unwrap();
   let result:crate::Result<Option<()>>=jobs::with_active_lease_transaction(conn,lease,|tx,_|{
@@ -203,10 +246,11 @@ fn terminal_replay_rejects_each_incomplete_or_wrong_binding() {
 					"expected {expected:?}"
 				);
 			}
-			rejected(t::replay_terminal(tx, 999, &[1; 32], &[2; 32])?, t::Reject::MissingJob);
-			rejected(t::replay_terminal(tx, 101, &[1; 32], &[2; 32])?, t::Reject::NonterminalJob);
+			tx.execute_batch("INSERT INTO workers VALUES(1,'worker','worker',x'01',0,0,NULL); UPDATE jobs SET worker_id=1 WHERE id=101;")?;
+			rejected(replay(tx, 999, &[1; 32], &[2; 32])?, t::Reject::Denied);
+			rejected(replay(tx, 101, &[1; 32], &[2; 32])?, t::Reject::Denied);
 			tx.execute("UPDATE jobs SET state='succeeded' WHERE id=101", [])?;
-			rejected(t::replay_terminal(tx, 101, &[1; 32], &[2; 32])?, t::Reject::MissingReceipt);
+			rejected(replay(tx, 101, &[1; 32], &[2; 32])?, t::Reject::Denied);
 			let data = payload();
 			let why = reason();
 			let new = t::NewReceipt {
@@ -224,17 +268,17 @@ fn terminal_replay_rejects_each_incomplete_or_wrong_binding() {
 			};
 			t::insert(tx, &new, 1)?;
 			assert!(
-				matches!(t::replay_terminal(tx,101,&[1;32],&[2;32])?,t::Replayed::Receipt(r) if r.job_id==101)
+				matches!(replay(tx,101,&[1;32],&[2;32])?,t::Replayed::Receipt(r) if r.job_id==101)
 			);
-			rejected(t::replay_terminal(tx, 101, &[9; 32], &[2; 32])?, t::Reject::WrongCapability);
-			rejected(t::replay_terminal(tx, 101, &[1; 32], &[9; 32])?, t::Reject::WrongDigest);
+			rejected(replay(tx, 101, &[9; 32], &[2; 32])?, t::Reject::Denied);
+			rejected(replay(tx, 101, &[1; 32], &[9; 32])?, t::Reject::WrongDigest);
 			tx.execute(
 				"UPDATE job_terminal_receipts SET finishing_capability_hash=NULL WHERE job_id=101",
 				[],
 			)?;
 			rejected(
-				t::replay_terminal(tx, 101, &[1; 32], &[2; 32])?,
-				t::Reject::MissingCapability,
+				replay(tx, 101, &[1; 32], &[2; 32])?,
+				t::Reject::Denied,
 			);
 			assert!(matches!(
 				t::insert(tx, &new, 2),

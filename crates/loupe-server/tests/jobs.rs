@@ -134,6 +134,200 @@ async fn phase_advertisements_do_not_open_public_runtime_gates() {
 	f.handle.shutdown().await;
 }
 
+// Deliberately persisted lease fixture: public claims remain closed. These
+// tests pin the boundary that must still hold once phase claims are enabled.
+async fn campaign_verify_fixture() -> (Fixture, LeaseEnvelope, i64) {
+	use loupe_server::review::campaign;
+	use loupe_server::review::policy::ReviewPolicy;
+	let f = bring_up_with_repo_and_worker().await;
+	let scan = enqueue_scan(&f, f.repo_id).await;
+	let scan_lease = lease_job(&f.worker).await;
+	submit_finding(&f.worker, &scan_lease, finding("Phase boundary", "phase-boundary")).await;
+	let finding_id =
+		f.db.with_conn(|conn| {
+			let finding_id =
+				conn.query_row("SELECT id FROM findings WHERE job_id=?1", [scan.job_id], |row| {
+					row.get::<_, i64>(0)
+				})?;
+			conn.execute("UPDATE findings SET state='validating' WHERE id=?1", [finding_id])?;
+			loupe_storage::jobs::enqueue(
+				conn,
+				&loupe_storage::jobs::NewJob {
+					repo_id: f.repo_id,
+					kind: loupe_core::JobKind::Verify,
+					incremental: false,
+					since_sha: None,
+					parent_job_id: Some(scan.job_id),
+					target_finding_id: Some(finding_id),
+				},
+				0,
+			)?;
+			Ok(finding_id)
+		})
+		.unwrap();
+	let env = lease_verify_job(&f.worker).await;
+	// Positive control: an ordinary verifier retains its existing read access.
+	assert_eq!(
+		f.worker
+			.get(format!("https://loupe-server/v1/findings/{finding_id}"))
+			.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
+			.send()
+			.await
+			.unwrap()
+			.status(),
+		200
+	);
+	f.db.with_conn(|conn| {
+		loupe_storage::transaction::immediate(conn, |tx| {
+			let campaign::Opened::Created { campaign_id, .. } = campaign::open(
+				tx,
+				&campaign::OpenCampaign {
+					repo_id: f.repo_id,
+					trigger: loupe_storage::campaigns::Trigger::Manual,
+					requested_ref: campaign::RequestedRef::Branch("main"),
+					base_sha: None,
+					kind_hint: campaign::KindHint::Incremental,
+				},
+				&ReviewPolicy::default(),
+				0,
+			)?
+			else {
+				panic!("new campaign")
+			};
+			tx.execute("UPDATE jobs SET campaign_id=?2 WHERE id=?1", (env.job_id, campaign_id))?;
+			Ok(())
+		})
+	})
+	.unwrap();
+	(f, env, finding_id)
+}
+
+#[tokio::test]
+async fn campaign_capability_cannot_read_legacy_finding_routes() {
+	let (f, env, finding_id) = campaign_verify_fixture().await;
+	let mut responses = Vec::new();
+	for path in [
+		format!("/v1/repos/{}/findings/search?q=Phase", f.repo_id),
+		format!("/v1/findings/{finding_id}"),
+		"/v1/findings/9223372036854775807".into(),
+	] {
+		let response = f
+			.worker
+			.get(format!("https://loupe-server{path}"))
+			.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
+			.send()
+			.await
+			.unwrap();
+		responses.push((response.status().as_u16(), response.text().await.unwrap()));
+	}
+	assert_eq!(
+		responses,
+		vec![(403, "invalid or expired job capability".into()); 3],
+		"campaign capability must not inherit repository-wide reads or an existence oracle"
+	);
+	assert_eq!(
+		f.admin
+			.get(format!("https://loupe-server/v1/findings/{finding_id}"))
+			.send()
+			.await
+			.unwrap()
+			.status(),
+		200
+	);
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn campaign_capability_cannot_submit_legacy_verdict() {
+	let (f, env, finding_id) = campaign_verify_fixture().await;
+	let response = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/verdict", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
+		.json(&VerdictSubmission {
+			protocol_version: PROTOCOL_VERSION,
+			verdict: Verdict::Dismissed { notes: Some("legacy route bypass".into()) },
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(response.status(), 403, "campaign verify must use phase finalization");
+	f.db.with_conn(|conn| {
+		assert_eq!(
+			conn.query_row("SELECT state FROM findings WHERE id=?1", [finding_id], |r| r
+				.get::<_, String>(0))?,
+			"validating"
+		);
+		assert_eq!(
+			conn.query_row(
+				"SELECT COUNT(*) FROM finding_verifications WHERE job_id=?1",
+				[env.job_id],
+				|r| r.get::<_, i64>(0)
+			)?,
+			0
+		);
+		Ok(())
+	})
+	.unwrap();
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn campaign_capability_cannot_use_legacy_lifecycle() {
+	let mut statuses = Vec::new();
+	for operation in ["heartbeat", "complete"] {
+		let (f, env, _) = campaign_verify_fixture().await;
+		let body = if operation == "heartbeat" {
+			serde_json::json!({"protocol_version":PROTOCOL_VERSION})
+		} else {
+			serde_json::json!({"protocol_version":PROTOCOL_VERSION,"outcome":"failed","error":"failed execution"})
+		};
+		let response = f
+			.worker
+			.post(format!("https://loupe-server/v1/jobs/{}/{operation}", env.job_id))
+			.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
+			.json(&body)
+			.send()
+			.await
+			.unwrap();
+		statuses.push(response.status().as_u16());
+		f.handle.shutdown().await;
+	}
+	assert_eq!(
+		statuses,
+		vec![403, 403],
+		"phase lifecycle stays closed until its deadline-aware handler exists"
+	);
+}
+
+#[tokio::test]
+async fn campaign_capability_is_rejected_by_legacy_transaction_recheck() {
+	let (f, env, _) = campaign_verify_fixture().await;
+	f.db.with_conn(|conn| {
+		let job = loupe_storage::jobs::get(conn, env.job_id)?.unwrap();
+		let hash = blake3::hash(env.job_capability.expose_secret().as_bytes());
+		let result = loupe_storage::jobs::with_active_lease_transaction(
+			conn,
+			loupe_storage::jobs::ActiveLease {
+				identity: loupe_storage::jobs::LeaseIdentity {
+					job_id: job.id,
+					worker_id: job.worker_id.unwrap(),
+					capability_hash: hash.as_bytes(),
+				},
+				now: job.lease_expires_at.unwrap() - 1,
+			},
+			|_, _| Ok(7),
+		)?;
+		assert_eq!(
+			result, None,
+			"transaction recheck must not grant campaign work legacy authority"
+		);
+		Ok(())
+	})
+	.unwrap();
+	f.handle.shutdown().await;
+}
+
 fn client(ca_cert_pem: &str, cert_pem: &str, key_pem: &str, addr: SocketAddr) -> reqwest::Client {
 	reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(ca_cert_pem))

@@ -76,6 +76,27 @@ fn units(tx: &Transaction<'_>) -> crate::Result<()> {
 	}
 	Ok(())
 }
+#[test]
+fn assignment_retains_the_claimed_epoch() {
+	let db = fixture();
+	db.with_conn(|conn| {
+		transaction::immediate(conn, |tx| {
+			units(tx)?;
+			crate::review_units::assign(
+				tx,
+				101,
+				&[crate::review_units::Assignment { unit_id: 11, expected_epoch: 0 }],
+			)?;
+			let epoch: Option<i64> = tx.query_row(
+			"SELECT assignment_epoch FROM job_assigned_review_units WHERE job_id=101 AND review_unit_id=11",
+			[], |row| row.get(0),
+		)?;
+			assert_eq!(epoch, Some(1), "assignment must retain the epoch actually claimed");
+			Ok(())
+		})
+	})
+	.unwrap();
+}
 pub(crate) fn findings(tx: &Transaction<'_>) -> crate::Result<()> {
 	for (id, repo, job) in [(11, 1, 101), (12, 1, 102), (21, 2, 201)] {
 		tx.execute("INSERT INTO findings (id,repo_id,job_id,scanner_id,severity,title,description,fingerprint,created_at) VALUES (?1,?2,?3,'test','high','title','description',?1,0)",params![id,repo,job])?;

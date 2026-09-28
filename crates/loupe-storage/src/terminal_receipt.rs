@@ -1,7 +1,7 @@
 //! Terminal retries are authenticated by their original finishing capability.
 use loupe_core::text::policy::{Payload, Reason, Title};
 use loupe_core::text::{BoundedJson, BoundedText};
-use loupe_core::{JobKind, JobState};
+use loupe_core::JobKind;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::review::{is_unique, optional, parsed, standalone, string_enum};
@@ -35,7 +35,6 @@ pub struct Receipt {
 	pub result_digest: Vec<u8>,
 	pub evidence_rung: Option<EvidenceRung>,
 	pub result_counts: Option<BoundedJson<Payload>>,
-	finishing_capability_hash: Option<Vec<u8>>,
 	pub created_at: i64,
 }
 impl std::fmt::Debug for Receipt {
@@ -48,11 +47,7 @@ impl std::fmt::Debug for Receipt {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reject {
-	MissingJob,
-	NonterminalJob,
-	MissingReceipt,
-	MissingCapability,
-	WrongCapability,
+	Denied,
 	WrongDigest,
 }
 #[derive(Debug, Clone)]
@@ -83,28 +78,37 @@ pub fn insert(tx: &Transaction<'_>, new: &NewReceipt<'_>, now: i64) -> Result<i6
 	Ok(tx.last_insert_rowid())
 }
 pub fn get(conn: &Connection, job: i64) -> Result<Option<Receipt>> {
-	Ok(conn.query_row("SELECT job_terminal_receipt_id,job_id,phase,terminal_reason,subject_title,subject_digest,pinned_commit_sha,effective_recipe,result_digest,evidence_rung,result_counts,finishing_capability_hash,created_at FROM job_terminal_receipts WHERE job_id=?1",[job],|r|Ok(Receipt{receipt_id:r.get(0)?,job_id:r.get(1)?,phase:parsed(r,2)?,terminal_reason:parsed(r,3)?,subject_title:optional(r,4)?,subject_digest:r.get(5)?,pinned_commit_sha:r.get(6)?,effective_recipe:parsed(r,7)?,result_digest:r.get(8)?,evidence_rung:optional(r,9)?,result_counts:optional(r,10)?,finishing_capability_hash:r.get(11)?,created_at:r.get(12)?})).optional()?)
+	Ok(conn.query_row("SELECT job_terminal_receipt_id,job_id,phase,terminal_reason,subject_title,subject_digest,pinned_commit_sha,effective_recipe,result_digest,evidence_rung,result_counts,created_at FROM job_terminal_receipts WHERE job_id=?1",[job],|r|Ok(Receipt{receipt_id:r.get(0)?,job_id:r.get(1)?,phase:parsed(r,2)?,terminal_reason:parsed(r,3)?,subject_title:optional(r,4)?,subject_digest:r.get(5)?,pinned_commit_sha:r.get(6)?,effective_recipe:parsed(r,7)?,result_digest:r.get(8)?,evidence_rung:optional(r,9)?,result_counts:optional(r,10)?,created_at:r.get(11)?})).optional()?)
 }
+/// Receipt-only authentication, independent of rebuildable campaign state.
+/// `digest` must be computed from the validated terminal payload by the server.
+/// Finalizers retain `jobs.worker_id` with the receipt in the same transaction.
 pub fn replay_terminal(
-	tx: &Transaction<'_>, job: i64, capability: &[u8; 32], digest: &[u8; 32],
+	tx: &Transaction<'_>, identity: crate::jobs::LeaseIdentity<'_>, phase: JobKind,
+	digest: &[u8; 32],
 ) -> Result<Replayed> {
-	let state: Option<JobState> =
-		tx.query_row("SELECT state FROM jobs WHERE id=?1", [job], |r| parsed(r, 0)).optional()?;
-	let Some(state) = state else {
-		return Ok(Replayed::Reject(Reject::MissingJob));
-	};
-	if !state.is_terminal() {
-		return Ok(Replayed::Reject(Reject::NonterminalJob));
+	if identity.capability_hash.len() != 32
+		|| !matches!(phase, JobKind::Survey | JobKind::Drilldown | JobKind::Verify)
+	{
+		return Ok(Replayed::Reject(Reject::Denied));
 	}
+	let bound: bool = tx.query_row(
+		"SELECT EXISTS(SELECT 1 FROM jobs j JOIN workers w ON w.id=j.worker_id
+		 JOIN job_terminal_receipts r ON r.job_id=j.id
+		 WHERE j.id=?1 AND j.worker_id=?2 AND w.kind='worker' AND w.revoked_at IS NULL
+		 AND j.kind=?3 AND j.campaign_id IS NOT NULL
+		 AND r.phase=?3 AND r.finishing_capability_hash=?4
+		 AND j.state IN ('succeeded','failed','cancelled'))",
+		params![identity.job_id, identity.worker_id, phase.as_str(), identity.capability_hash],
+		|row| row.get(0),
+	)?;
+	if !bound {
+		return Ok(Replayed::Reject(Reject::Denied));
+	}
+	let job = identity.job_id;
 	let Some(receipt) = get(tx, job)? else {
-		return Ok(Replayed::Reject(Reject::MissingReceipt));
+		return Ok(Replayed::Reject(Reject::Denied));
 	};
-	let Some(stored) = &receipt.finishing_capability_hash else {
-		return Ok(Replayed::Reject(Reject::MissingCapability));
-	};
-	if stored != capability {
-		return Ok(Replayed::Reject(Reject::WrongCapability));
-	}
 	if receipt.result_digest != digest {
 		return Ok(Replayed::Reject(Reject::WrongDigest));
 	}

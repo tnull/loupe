@@ -413,7 +413,8 @@ pub struct JobFilter {
 	pub limit: Option<i64>,
 }
 
-/// Resolve an opaque capability to its one exact, live lease.
+/// Resolve an opaque capability to its one exact, live legacy lease.
+/// Campaign verification shares the verify kind but never legacy authority.
 pub fn get_active_by_capability_hash(
 	conn: &Connection, worker_id: i64, job_capability_hash: &[u8], now: i64,
 ) -> rusqlite::Result<Option<JobRow>> {
@@ -425,6 +426,7 @@ pub fn get_active_by_capability_hash(
 			   AND state = 'leased'
 			   AND lease_expires_at IS NOT NULL
 			   AND lease_expires_at >= ?3
+			   AND campaign_id IS NULL
 			   AND kind IN ({runtime})",
 			runtime = runtime_kinds_sql(),
 		),
@@ -434,8 +436,8 @@ pub fn get_active_by_capability_hash(
 	.optional()
 }
 
-/// Run a mutation in one transaction tied to the exact lease the
-/// caller previously authorized. Returning `None` means that lease is
+/// Run a legacy mutation in one transaction tied to the exact lease the
+/// caller previously authorized. Returning `None` means that legacy lease is
 /// no longer active and the mutation was not run.
 pub fn with_active_lease_transaction<T>(
 	conn: &mut Connection, lease: ActiveLease<'_>,

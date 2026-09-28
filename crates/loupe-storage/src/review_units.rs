@@ -163,7 +163,7 @@ pub fn assign(tx: &Transaction<'_>, job: i64, units: &[Assignment]) -> Result<()
 		|r| r.get(0),
 	)?;
 	for (offset, claim) in units.iter().enumerate() {
-		tx.execute("INSERT INTO job_assigned_review_units (job_id,review_unit_id,position) VALUES (?1,?2,?3)",params![job,claim.unit_id,start + offset as i64])?;
+		tx.execute("INSERT INTO job_assigned_review_units (job_id,review_unit_id,position,assignment_epoch) SELECT ?1,review_unit_id,?3,assignment_epoch FROM review_units WHERE review_unit_id=?2",params![job,claim.unit_id,start + offset as i64])?;
 	}
 	Ok(())
 }
