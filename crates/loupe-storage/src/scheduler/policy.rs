@@ -63,6 +63,12 @@ impl CampaignPolicy {
 	pub fn from_snapshot(snapshot: &BoundedJson<Payload>) -> Result<Self> {
 		let policy: Self = serde_json::from_str(snapshot.expose())
 			.map_err(|_| Error::Conflict(Conflict::CampaignPolicy))?;
+		policy.validate()?;
+		Ok(policy)
+	}
+
+	pub(crate) fn validate(&self) -> Result<()> {
+		let policy = self;
 		let valid = policy.version == 1
 			&& (1..=32).contains(&policy.survey_units_per_job)
 			&& policy.max_attempts > 0
@@ -80,7 +86,7 @@ impl CampaignPolicy {
 					&& phase.token_budget.is_none_or(|n| n > 0 && n <= i64::MAX as u64)
 			});
 		if valid {
-			Ok(policy)
+			Ok(())
 		} else {
 			Err(Error::Conflict(Conflict::CampaignPolicy))
 		}

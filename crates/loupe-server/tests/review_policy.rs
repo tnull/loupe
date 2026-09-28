@@ -2,6 +2,87 @@ use loupe_server::review::policy::ReviewPolicy;
 use loupe_server::FileConfig;
 
 #[test]
+fn review_toml_accepts_v2_admission_keys() {
+	let parsed = toml::from_str::<FileConfig>(
+		"[review]\nmax_units_per_survey=32\nmax_leads_per_survey=16\nmax_sibling_leads_per_drilldown=4\ncampaign_urgent_reserve=4\ncampaign_verification_reserve=4\n",
+	);
+	assert!(parsed.is_ok(), "v2 admission configuration must be accepted: {parsed:?}");
+}
+
+#[test]
+fn v2_snapshots_freeze_admission_without_changing_v1_bytes() {
+	use loupe_storage::admission_policy::CampaignPolicyV2;
+	let policy = ReviewPolicy::default();
+	let old = policy.snapshot().unwrap();
+	let new = policy.snapshot_v2().unwrap();
+	assert_eq!(CampaignPolicyV2::from_snapshot(&new).unwrap(), CampaignPolicyV2::default());
+	assert!(!new.expose().contains("campaign_handoff_reserve"));
+	let mut changed = policy.clone();
+	changed.max_units_per_survey = 64;
+	changed.max_leads_per_survey = 30;
+	changed.max_sibling_leads_per_drilldown = 8;
+	changed.campaign_urgent_reserve = 8;
+	assert_eq!(changed.snapshot().unwrap(), old);
+	assert_ne!(changed.snapshot_v2().unwrap(), new);
+	let frozen = CampaignPolicyV2::from_snapshot(&new).unwrap();
+	assert_eq!(frozen.general_capacity().unwrap(), 56);
+	changed = policy;
+	changed.active_jobs_per_repo = 8;
+	changed.lease_seconds = 500;
+	changed.urgency_burst_length = 2;
+	assert_eq!(changed.snapshot_v2().unwrap(), new);
+}
+
+#[test]
+fn v2_validation_is_explicit_and_does_not_import_legacy_reserve() {
+	let mut small = ReviewPolicy { campaign_max_jobs: 3, ..ReviewPolicy::default() };
+	assert!(small.snapshot().is_ok());
+	assert!(small.snapshot_v2().is_err());
+	let old_config: FileConfig = toml::from_str("[review]\ncampaign_max_jobs=3").unwrap();
+	assert!(
+		old_config.review.resolve().is_ok(),
+		"inert rollout must preserve old small-cap configurations"
+	);
+	small.campaign_max_jobs = 1;
+	small.campaign_urgent_reserve = 0;
+	small.campaign_verification_reserve = 0;
+	assert!(small.snapshot().is_err(), "v1 still owns its shared handoff reserve");
+	assert!(small.snapshot_v2().is_ok(), "v2 ignores the obsolete shared reserve");
+	let explicit: FileConfig = toml::from_str(
+		"[review]\ncampaign_max_jobs=1\ncampaign_urgent_reserve=0\ncampaign_verification_reserve=0",
+	)
+	.unwrap();
+	assert!(explicit.review.resolve().is_ok());
+}
+
+#[test]
+fn admission_toml_validation_is_checked_and_wire_sized() {
+	for raw in [
+		"max_units_per_survey=0",
+		"max_leads_per_survey=0",
+		"max_sibling_leads_per_drilldown=0",
+		"campaign_urgent_reserve=-1",
+		"campaign_verification_reserve=-1",
+		"campaign_urgent_reserve=60",
+		"campaign_urgent_reserve=9223372036854775807",
+		"campaign_max_jobs=3\nmax_units_per_survey=32",
+	] {
+		let config: FileConfig = toml::from_str(&format!("[review]\n{raw}")).unwrap();
+		assert!(config.review.resolve().is_err(), "{raw}");
+	}
+	for raw in
+		["max_units_per_survey=4294967296", "max_leads_per_survey=-1", "priority_policy_version=2"]
+	{
+		assert!(toml::from_str::<FileConfig>(&format!("[review]\n{raw}")).is_err(), "{raw}");
+	}
+	let config: FileConfig = toml::from_str("[review]\nmax_units_per_survey=4294967295\nmax_leads_per_survey=40\nmax_sibling_leads_per_drilldown=8").unwrap();
+	let policy = config.review.resolve().unwrap();
+	assert_eq!(policy.max_units_per_survey, u32::MAX);
+	assert_eq!(policy.max_leads_per_survey, 40);
+	assert_eq!(policy.max_sibling_leads_per_drilldown, 8);
+}
+
+#[test]
 fn review_policy_defaults_and_snapshot_are_stable() {
 	let policy = ReviewPolicy::default();
 	policy.validate().unwrap();

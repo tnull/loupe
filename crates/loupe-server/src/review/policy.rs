@@ -29,6 +29,11 @@ pub struct ReviewPolicy {
 	pub campaign_handoff_reserve: i64,
 	pub campaign_deadline_seconds: i64,
 	pub campaign_max_jobs: i64,
+	pub max_units_per_survey: u32,
+	pub max_leads_per_survey: u32,
+	pub max_sibling_leads_per_drilldown: u32,
+	pub campaign_urgent_reserve: i64,
+	pub campaign_verification_reserve: i64,
 	pub priority_aging_interval_seconds: i64,
 	pub priority_aging_cap: i64,
 	pub survey_token_budget: Option<u64>,
@@ -60,6 +65,11 @@ impl Default for ReviewPolicy {
 			campaign_handoff_reserve: 2,
 			campaign_deadline_seconds: 21600,
 			campaign_max_jobs: 64,
+			max_units_per_survey: 32,
+			max_leads_per_survey: 16,
+			max_sibling_leads_per_drilldown: 4,
+			campaign_urgent_reserve: 4,
+			campaign_verification_reserve: 4,
 			priority_aging_interval_seconds: 3600,
 			priority_aging_cap: 8,
 			survey_token_budget: None,
@@ -124,6 +134,17 @@ impl ReviewPolicy {
 			"campaign_deadline_seconds must be at least 1",
 		);
 		require(self.campaign_max_jobs >= 1, "campaign_max_jobs must be at least 1");
+		require(self.max_units_per_survey > 0, "max_units_per_survey must be at least 1");
+		require(self.max_leads_per_survey > 0, "max_leads_per_survey must be at least 1");
+		require(
+			self.max_sibling_leads_per_drilldown > 0,
+			"max_sibling_leads_per_drilldown must be at least 1",
+		);
+		require(self.campaign_urgent_reserve >= 0, "campaign_urgent_reserve must be nonnegative");
+		require(
+			self.campaign_verification_reserve >= 0,
+			"campaign_verification_reserve must be nonnegative",
+		);
 		require(
 			self.priority_aging_interval_seconds >= 1,
 			"priority_aging_interval_seconds must be at least 1",
@@ -245,6 +266,27 @@ impl ReviewPolicy {
 		}
 	}
 
+	/// Version-2 activation must use this at startup as well as snapshot creation.
+	/// The obsolete shared handoff reserve has no meaning under separate pools.
+	pub fn validate_v2(&self) -> Result<(), PolicyError> {
+		let mut execution = self.clone();
+		execution.campaign_handoff_reserve = 0;
+		let mut violations =
+			execution.validate().err().map(|error| error.violations).unwrap_or_default();
+		if self
+			.campaign_urgent_reserve
+			.checked_add(self.campaign_verification_reserve)
+			.is_none_or(|sum| sum >= self.campaign_max_jobs)
+		{
+			violations.push("campaign_urgent_reserve plus campaign_verification_reserve must be below campaign_max_jobs without overflow".into());
+		}
+		if violations.is_empty() {
+			Ok(())
+		} else {
+			Err(PolicyError { violations })
+		}
+	}
+
 	pub fn claim_policy(&self) -> ClaimPolicy {
 		ClaimPolicy {
 			active_jobs_per_repo: self.active_jobs_per_repo,
@@ -284,6 +326,38 @@ impl ReviewPolicy {
 		});
 		BoundedJson::new(&value.to_string())
 			.map_err(|error| PolicyError { violations: vec![error.to_string()] })
+	}
+
+	/// Explicitly opt in only when the version-2 admission consumers are ready.
+	/// Existing campaign creation continues calling the unchanged v1 snapshot.
+	pub fn snapshot_v2(&self) -> Result<BoundedJson<Payload>, PolicyError> {
+		self.validate_v2()?;
+		loupe_storage::admission_policy::CampaignPolicyV2 {
+			version: 2,
+			survey_units_per_job: self.survey_units_per_job,
+			survey_deadline_seconds: self.survey_deadline_seconds,
+			survey_submit_margin_seconds: self.survey_submit_margin_seconds,
+			drilldown_deadline_seconds: self.drilldown_deadline_seconds,
+			drilldown_submit_margin_seconds: self.drilldown_submit_margin_seconds,
+			verify_deadline_seconds: self.verify_deadline_seconds,
+			verify_submit_margin_seconds: self.verify_submit_margin_seconds,
+			max_attempts: self.max_attempts,
+			retry_backoff_base_seconds: self.retry_backoff_base_seconds,
+			retry_backoff_cap_seconds: self.retry_backoff_cap_seconds,
+			campaign_deadline_seconds: self.campaign_deadline_seconds,
+			campaign_max_jobs: self.campaign_max_jobs,
+			survey_token_budget: self.survey_token_budget,
+			drilldown_token_budget: self.drilldown_token_budget,
+			verify_token_budget: self.verify_token_budget,
+			max_units_per_survey: self.max_units_per_survey,
+			max_leads_per_survey: self.max_leads_per_survey,
+			max_sibling_leads_per_drilldown: self.max_sibling_leads_per_drilldown,
+			campaign_urgent_reserve: self.campaign_urgent_reserve,
+			campaign_verification_reserve: self.campaign_verification_reserve,
+			priority_policy_version: loupe_storage::admission_policy::PRIORITY_POLICY_VERSION,
+		}
+		.snapshot()
+		.map_err(|error| PolicyError { violations: vec![error.to_string()] })
 	}
 }
 
@@ -349,6 +423,21 @@ impl crate::config::ReviewSection {
 				.campaign_deadline_seconds
 				.unwrap_or(defaults.campaign_deadline_seconds),
 			campaign_max_jobs: self.campaign_max_jobs.unwrap_or(defaults.campaign_max_jobs),
+			max_units_per_survey: self
+				.max_units_per_survey
+				.unwrap_or(defaults.max_units_per_survey),
+			max_leads_per_survey: self
+				.max_leads_per_survey
+				.unwrap_or(defaults.max_leads_per_survey),
+			max_sibling_leads_per_drilldown: self
+				.max_sibling_leads_per_drilldown
+				.unwrap_or(defaults.max_sibling_leads_per_drilldown),
+			campaign_urgent_reserve: self
+				.campaign_urgent_reserve
+				.unwrap_or(defaults.campaign_urgent_reserve),
+			campaign_verification_reserve: self
+				.campaign_verification_reserve
+				.unwrap_or(defaults.campaign_verification_reserve),
 			priority_aging_interval_seconds: self
 				.priority_aging_interval_seconds
 				.unwrap_or(defaults.priority_aging_interval_seconds),
@@ -357,7 +446,16 @@ impl crate::config::ReviewSection {
 			drilldown_token_budget: self.drilldown_token_budget.or(defaults.drilldown_token_budget),
 			verify_token_budget: self.verify_token_budget.or(defaults.verify_token_budget),
 		};
-		policy.validate()?;
+		if self.max_units_per_survey.is_some()
+			|| self.max_leads_per_survey.is_some()
+			|| self.max_sibling_leads_per_drilldown.is_some()
+			|| self.campaign_urgent_reserve.is_some()
+			|| self.campaign_verification_reserve.is_some()
+		{
+			policy.validate_v2()?;
+		} else {
+			policy.validate()?;
+		}
 		Ok(policy)
 	}
 }
