@@ -329,7 +329,7 @@ impl ReviewPolicy {
 	}
 
 	/// Explicitly opt in only when the version-2 admission consumers are ready.
-	/// Existing campaign creation continues calling the unchanged v1 snapshot.
+	/// New campaigns freeze this policy; historical v1 snapshots remain readable.
 	pub fn snapshot_v2(&self) -> Result<BoundedJson<Payload>, PolicyError> {
 		self.validate_v2()?;
 		loupe_storage::admission_policy::CampaignPolicyV2 {
@@ -446,16 +446,7 @@ impl crate::config::ReviewSection {
 			drilldown_token_budget: self.drilldown_token_budget.or(defaults.drilldown_token_budget),
 			verify_token_budget: self.verify_token_budget.or(defaults.verify_token_budget),
 		};
-		if self.max_units_per_survey.is_some()
-			|| self.max_leads_per_survey.is_some()
-			|| self.max_sibling_leads_per_drilldown.is_some()
-			|| self.campaign_urgent_reserve.is_some()
-			|| self.campaign_verification_reserve.is_some()
-		{
-			policy.validate_v2()?;
-		} else {
-			policy.validate()?;
-		}
+		policy.validate_v2()?;
 		Ok(policy)
 	}
 }

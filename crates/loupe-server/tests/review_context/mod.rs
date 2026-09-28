@@ -12,7 +12,7 @@ async fn ready() -> (Fixture, i64) {
 	f.state.db.with_conn(|conn| {
 		let policy=ReviewPolicy::default().snapshot_v2().unwrap();
 		conn.execute("UPDATE review_campaigns SET effective_policy=?2,effective_policy_digest=?3 WHERE campaign_id=?1",params![f.campaign,policy.expose(),policy.digest().as_slice()])?;
-		conn.execute("INSERT INTO campaign_admission_spending(campaign_id,policy_version,general_spent) VALUES(?1,2,1)",[f.campaign])?;
+		assert_eq!(conn.query_row("SELECT general_spent FROM campaign_admission_spending WHERE campaign_id=?1",[f.campaign],|r|r.get::<_,i64>(0))?,1);
 		conn.execute("UPDATE jobs SET soft_deadline_at=?2,submit_by=?2,token_budget=123 WHERE id=?1",params![f.job,now()+3000])?;
 		Ok(())
 	}).unwrap();
@@ -255,6 +255,7 @@ async fn context_denials_do_not_issue_candidates_or_disclose_limits() {
 			"wrong_worker"=>f.peer=f.other_peer.clone(),
 			"wrong_capability"=>f.token="b".repeat(43),
 			_=>f.state.db.with_conn(|conn| {
+				if defect=="legacy_verify" { conn.execute("DELETE FROM job_admission_charges WHERE job_id=?1",[f.job])?; }
 				let sql=match defect {"expired"=>"UPDATE jobs SET lease_expires_at=0 WHERE id=?1",
 					"cancelled"=>"UPDATE jobs SET state='cancelled',job_capability_hash=NULL WHERE id=?1",
 					"unprepared"=>"UPDATE jobs SET prepared_attempt=NULL,prepared_at=NULL,prepared_capability_hash=NULL WHERE id=?1",

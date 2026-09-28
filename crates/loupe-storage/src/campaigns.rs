@@ -108,12 +108,30 @@ fn counts(tx: &Transaction<'_>, sql: &str, id: Option<i64>) -> Result<serde_json
 	Ok(object.into())
 }
 pub fn summarize(tx: &Transaction<'_>, id: i64) -> Result<TerminalSummary> {
-	let campaign = get(tx, id)?.ok_or(Error::NotFound(Entity::Campaign, id))?;
-	let coverage = if let Some(generation) = campaign.generation_id {
-		ownership::generation(tx, campaign.repo_id, generation, Ownership::CampaignGeneration)?;
-		crate::generations::get(tx, generation)?
-			.ok_or(Error::NotFound(Entity::Generation, generation))?
-			.coverage
+	let (repo, generation): (i64, Option<i64>) = tx
+		.query_row(
+			"SELECT repo_id,generation_id FROM review_campaigns WHERE campaign_id=?1",
+			[id],
+			|r| Ok((r.get(0)?, r.get(1)?)),
+		)
+		.optional()?
+		.ok_or(Error::NotFound(Entity::Campaign, id))?;
+	let coverage = if let Some(generation) = generation {
+		ownership::generation(tx, repo, generation, Ownership::CampaignGeneration)?;
+		let coverage: crate::generations::Coverage = tx.query_row(
+			"SELECT coverage FROM review_generations WHERE generation_id=?1",
+			[generation],
+			|r| parsed(r, 0),
+		)?;
+		// Stored completion is never a substitute for current exact coverage.
+		// Conversely, this snapshot cannot promote unknown/partial coverage.
+		if coverage == crate::generations::Coverage::Complete
+			&& !crate::generations::coverage_rollup(tx, generation)?.complete()
+		{
+			crate::generations::Coverage::Partial
+		} else {
+			coverage
+		}
 	} else {
 		crate::generations::Coverage::Unknown
 	};
@@ -132,12 +150,12 @@ pub fn summarize(tx: &Transaction<'_>, id: i64) -> Result<TerminalSummary> {
 		let (kind, state, count) = record?;
 		jobs.push(serde_json::json!({ "kind": kind, "state": state, "count": count }));
 	}
-	let generation = campaign.generation_id;
 	let value = serde_json::json!({ "jobs": jobs, "leads": {
 		"status": counts(tx,"SELECT status,COUNT(*) FROM leads WHERE generation_id=?1 GROUP BY status",generation)?,
 		"disposition": counts(tx,"SELECT disposition,COUNT(*) FROM leads WHERE generation_id=?1 AND disposition IS NOT NULL GROUP BY disposition",generation)?
 	}, "findings": counts(tx,"SELECT f.state,COUNT(*) FROM findings f JOIN finding_review_details d ON d.finding_id=f.id JOIN leads l ON l.lead_id=d.origin_lead_id WHERE l.generation_id=?1 GROUP BY f.state",generation)?,
-	"verdicts": counts(tx,"SELECT v.verdict,COUNT(*) FROM finding_verifications v JOIN finding_review_details d ON d.finding_id=v.finding_id JOIN leads l ON l.lead_id=d.origin_lead_id WHERE l.generation_id=?1 GROUP BY v.verdict",generation)? });
+	"verdicts": counts(tx,"SELECT v.verdict,COUNT(*) FROM finding_verifications v JOIN finding_review_details d ON d.finding_id=v.finding_id JOIN leads l ON l.lead_id=d.origin_lead_id WHERE l.generation_id=?1 GROUP BY v.verdict",generation)?,
+	"pending_work": crate::campaign_work::summary(tx,id)? });
 	Ok(TerminalSummary { campaign_id: id, coverage, counts: BoundedJson::new(&value.to_string())? })
 }
 pub fn finish(

@@ -59,7 +59,7 @@ impl AppState {
 	pub fn with_review_policy(
 		mut self, policy: crate::review::policy::ReviewPolicy,
 	) -> Result<Self, crate::review::policy::PolicyError> {
-		policy.validate()?;
+		policy.validate_v2()?;
 		self.review_policy = Arc::new(policy);
 		Ok(self)
 	}

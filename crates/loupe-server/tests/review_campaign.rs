@@ -12,6 +12,9 @@ const NEW: &str = "cccccccccccccccccccccccccccccccccccccccc";
 const DIFFERENT: &str = "dddddddddddddddddddddddddddddddddddddddd";
 const OTHER: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
+#[path = "review_campaign_v2/mod.rs"]
+mod v2;
+
 fn fixture() -> Db {
 	let db = Db::open_in_memory(&loupe_storage::secrets::MasterKey::for_tests()).unwrap();
 	db.with_conn(|c| {
@@ -44,6 +47,7 @@ fn ready(tx: &rusqlite::Transaction<'_>, generation: i64) -> loupe_storage::Resu
 		"UPDATE review_generations SET inventory_digest=zeroblob(32) WHERE generation_id=?1",
 		[generation],
 	)?;
+	tx.execute("INSERT INTO generation_manifests(generation_id,format_version,expected_entry_count,expected_digest,created_at,sealed_at) VALUES(?1,1,0,zeroblob(32),0,0)",[generation])?;
 	Ok(())
 }
 
@@ -71,7 +75,7 @@ fn idle_campaign(
 }
 
 #[tokio::test]
-async fn background_scheduler_notifies_waiters_for_replenished_campaign_work() {
+async fn background_scheduler_does_not_allocate_or_notify_speculative_coverage() {
 	let db = std::sync::Arc::new(fixture());
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
 		as i64;
@@ -89,14 +93,22 @@ async fn background_scheduler_notifies_waiters_for_replenished_campaign_work() {
 	notified.as_mut().enable();
 	let handle =
 		loupe_server::background::spawn_scheduler(db.clone(), arrived.clone(), cancelled.clone());
-	let notification = tokio::time::timeout(std::time::Duration::from_secs(2), notified).await;
+	let notification = tokio::time::timeout(std::time::Duration::from_millis(100), notified).await;
 	cancelled.cancel();
 	handle.await.unwrap();
-	assert!(notification.is_ok(), "campaign replenishment must wake leasing workers");
+	assert!(notification.is_err(), "unchanged pending coverage is not a newly queued job");
 	db.with_conn(|c| {
 		let queued: i64 =
 			c.query_row("SELECT COUNT(*) FROM jobs WHERE state='queued'", [], |r| r.get(0))?;
-		assert_eq!(queued, 1, "the notification must correspond to the new coverage survey");
+		assert_eq!(queued, 0, "only a winning first claim may create coverage work");
+		assert_eq!(
+			c.query_row("SELECT COUNT(*) FROM review_campaigns WHERE state='active'", [], |r| r
+				.get::<_, i64>(
+				0
+			))?,
+			1,
+			"no worker is not a completion condition"
+		);
 		Ok(())
 	})
 	.unwrap();
@@ -120,7 +132,7 @@ fn open_pins_only_known_commits_and_freezes_policy() {
 				let row = campaigns::get(tx, campaign)?.unwrap();
 				assert_eq!(row.recipe, campaigns::Recipe::Bootstrap);
 				assert_eq!(row.deadline_at, Some(21700));
-				assert_eq!(row.effective_policy, policy.snapshot().unwrap());
+				assert_eq!(row.effective_policy, policy.snapshot_v2().unwrap());
 				assert_eq!(row.generation_id.is_some(), pinned);
 				let job = jobs::get(tx, job)?.unwrap();
 				assert_eq!(job.kind, JobKind::Survey);
@@ -361,12 +373,15 @@ fn pin_selects_active_continuation_or_matching_successor() {
 				} else {
 					None
 				};
-				let (campaign, _) = created(campaign::open(
+				// Exercise post-checkout target discovery, not an already-known
+				// successor which open now defers without allocating a job.
+				let (campaign, job) = created(campaign::open(
 					tx,
-					&request(RequestedRef::Pinned(SHA)),
+					&request(RequestedRef::Branch("main")),
 					&ReviewPolicy::default(),
 					2,
 				)?);
+				campaign::pin(tx, campaign, job, SHA, 2)?;
 				let row = campaigns::get(tx, campaign)?.unwrap();
 				assert_eq!(row.recipe, campaigns::Recipe::Incremental);
 				let generation = row.generation_id.unwrap();
@@ -402,7 +417,8 @@ fn recipe_selection_uses_only_an_active_baseline() {
 					tx.execute("INSERT INTO review_generations(repo_id,generation_commit_sha,state,workflow_contract_version,created_at) VALUES(1,?2,?1,1,0)",rusqlite::params![state, SHA])?;
 				}
 				let mut new=request(RequestedRef::Branch("main"));new.kind_hint=hint;
-				let (campaign,_)=created(campaign::open(tx,&new,&ReviewPolicy::default(),0)?);
+				let opened=campaign::open(tx,&new,&ReviewPolicy::default(),0)?;
+				let campaign=match opened { Opened::Created{campaign_id,..}|Opened::Deferred{campaign_id}=>campaign_id,other=>panic!("new campaign {other:?}") };
 				let expected=if state!=Some("active") {campaigns::Recipe::Bootstrap} else if hint==KindHint::FullReview {campaigns::Recipe::Reconciliation} else {campaigns::Recipe::Incremental};
 				assert_eq!(campaigns::get(tx,campaign)?.unwrap().recipe,expected);
 				Ok(())
@@ -428,31 +444,71 @@ fn bootstrap_activation_requires_profile_and_inventory() {
 }
 
 #[test]
-fn replenish_uses_coverage_recipe_and_frozen_budget_after_activation() {
+fn first_claim_allocates_coverage_with_frozen_budget_after_activation() {
 	let db = fixture();
-	db.with_conn(|c|transaction::immediate(c,|tx| {
-		let policy=ReviewPolicy{campaign_max_jobs:3,campaign_handoff_reserve:1,..ReviewPolicy::default()};
-		let (campaign,job)=created(campaign::open(tx,&request(RequestedRef::Pinned(SHA)),&policy,0)?);
-		let generation=jobs::get(tx,job)?.unwrap().generation_id.unwrap();
-		ready(tx,generation)?;
-		tx.execute("INSERT INTO review_units(generation_id,client_review_unit_key,title,objective,source_refs,priority_band,created_at) VALUES(?1,'u','t','o','[]','high',0)",[generation])?;
-		assert_eq!(campaign::replenish(tx,campaign,1)?,None,"building generations must not receive ordinary coverage work");
-		tx.execute("UPDATE jobs SET state='succeeded',finished_at=1 WHERE id=?1",[job])?;
-		campaign::activate_generation(tx,campaign,1)?;
-		let next=campaign::replenish(tx,campaign,1)?.unwrap();
-		let row=jobs::get(tx,next)?.unwrap();
-		let recipe:serde_json::Value=serde_json::from_str(row.recipe.unwrap().expose()).unwrap();
-		assert_eq!(recipe["recipe"],"coverage");
-		assert_eq!(row.continuation_of_job_id,Some(job));
-		assert_eq!(row.scheduling_band,Some(loupe_storage::scheduler::Band::High));
-		assert_eq!(campaign::replenish(tx,campaign,2)?,None,"at most one queued survey");
-		tx.execute("UPDATE jobs SET state='succeeded',finished_at=2 WHERE id=?1",[next])?;
-		assert_eq!(campaign::replenish(tx,campaign,3)?,None,"frozen budget remains three, including the reserve");
-		let generation=generations::get(tx,generation)?.unwrap();
-		assert_eq!(generation.profile_version,1);
-		assert_eq!(generation.activated_at,Some(1));
-		Ok(())
-	})).unwrap();
+	db.with_conn(|c| {
+		transaction::immediate(c, |tx| {
+			let policy = ReviewPolicy {
+				campaign_max_jobs: 2,
+				campaign_urgent_reserve: 0,
+				campaign_verification_reserve: 0,
+				..ReviewPolicy::default()
+			};
+			let (campaign, generation) = idle_campaign(tx, 1, &policy, 0, true)?;
+			let worker = loupe_storage::workers::insert(
+				tx,
+				"coverage",
+				loupe_storage::workers::WorkerKind::Worker,
+				&[9; 32],
+				0,
+			)?;
+			assert_eq!(campaign::replenish(tx, campaign, 1)?, None);
+			let req = loupe_storage::admission_candidates::Request {
+				worker_id: worker,
+				legacy_kinds: &[],
+				phase_kinds: &[JobKind::Survey],
+				now: 1,
+				policy: &policy.claim_policy(),
+				limit: 1,
+			};
+			let candidates = loupe_storage::admission_candidates::ranked(tx, &req)?;
+			assert_eq!(candidates.len(), 1);
+			let outcome = loupe_storage::admission_claim::materialize(
+				tx,
+				&candidates[0],
+				&req,
+				&[8; 32],
+				900,
+			)?;
+			let loupe_storage::admission_claim::Outcome::Uncommitted(claimed) = outcome else {
+				panic!("winning ordinary work")
+			};
+			let row = claimed.job;
+			assert_eq!(row.kind, JobKind::Survey);
+			assert_eq!(row.state, JobState::Leased);
+			assert_eq!(row.scheduling_band, Some(loupe_storage::scheduler::Band::High));
+			assert_eq!(
+				row.continuation_of_job_id, None,
+				"ordinary coverage is not a logical continuation"
+			);
+			let recipe: serde_json::Value =
+				serde_json::from_str(row.recipe.unwrap().expose()).unwrap();
+			assert_eq!(recipe["recipe"], "coverage");
+			assert_eq!(claimed.assigned_units.len(), 1);
+			assert_eq!(loupe_storage::admission::get_spending(tx, campaign)?.unwrap().total()?, 2);
+			tx.execute("UPDATE jobs SET state='succeeded',finished_at=2 WHERE id=?1", [row.id])?;
+			assert_eq!(campaign::try_finish(tx, campaign, 3)?, Some(campaign::Finish::Completed));
+			assert_eq!(
+				campaigns::get(tx, campaign)?.unwrap().terminal_reason.unwrap().expose(),
+				"campaign_budget"
+			);
+			let generation = generations::get(tx, generation)?.unwrap();
+			assert_eq!(generation.profile_version, 1);
+			assert_eq!(generation.activated_at, Some(0));
+			Ok(())
+		})
+	})
+	.unwrap();
 }
 
 #[test]
@@ -491,11 +547,14 @@ fn idle_campaign_replenishes_before_finishing_and_snapshots_terminal_counts() {
 						[id],
 						|r| r.get(0),
 					)?;
-					assert_eq!(queued, 1);
+					assert_eq!(
+						queued, 0,
+						"pending ordinary work is not a speculative queued child"
+					);
 				} else {
 					assert_eq!(finish, Some(campaign::Finish::Completed));
 					assert_eq!(row.state, campaigns::State::Finished);
-					assert_eq!(row.terminal_reason.unwrap().expose(), "completed");
+					assert_eq!(row.terminal_reason.unwrap().expose(), "partial");
 					assert_eq!(row.coverage_at_finish, Some(generations::Coverage::Unknown));
 					let summary: serde_json::Value =
 						serde_json::from_str(row.terminal_counts.unwrap().expose()).unwrap();
@@ -528,7 +587,7 @@ fn deadline_cancels_only_queued_work_and_waits_for_the_leased_child() {
 			assert_eq!(campaign::try_finish(tx, id, 21600)?, None);
 			let cancelled = jobs::get(tx, queued)?.unwrap();
 			assert_eq!(cancelled.state, JobState::Cancelled);
-			assert_eq!(cancelled.error.as_deref(), Some("campaign deadline"));
+			assert_eq!(cancelled.error.as_deref(), Some("campaign_deadline"));
 			assert_eq!(jobs::get(tx, leased)?.unwrap().state, JobState::Leased);
 			assert_eq!(campaign::replenish(tx, id, 21600)?, None);
 			tx.execute("UPDATE jobs SET state='succeeded',finished_at=21601 WHERE id=?1", [leased])?;
@@ -568,8 +627,9 @@ fn tick_reports_budget_exhaustion_once_without_claiming_complete_coverage() {
 		.with_conn(|c| {
 			transaction::immediate(c, |tx| {
 				let policy = ReviewPolicy {
-					campaign_max_jobs: 2,
-					campaign_handoff_reserve: 1,
+					campaign_max_jobs: 1,
+					campaign_urgent_reserve: 0,
+					campaign_verification_reserve: 0,
 					..ReviewPolicy::default()
 				};
 				let (id, _) = idle_campaign(tx, 1, &policy, 0, true)?;
@@ -596,16 +656,17 @@ fn tick_rolls_back_a_failed_campaign_and_still_processes_other_repositories() {
 	let db = fixture();
 	let first = db.with_conn(|c| {
 		transaction::immediate(c, |tx| {
-			let (first, _) = idle_campaign(tx, 1, &ReviewPolicy::default(), 0, true)?;
+			let (first, _) = idle_campaign(tx, 1, &ReviewPolicy::default(), 0, false)?;
 			tx.execute("INSERT INTO registered_repos(id,clone_url,host,owner,repo,reporting,created_at) VALUES(2,'v','github.com','o','r2','{\"kind\":\"manual\"}',0)", [])?;
-			idle_campaign(tx, 2, &ReviewPolicy::default(), 0, true)?;
-			tx.execute_batch("CREATE TEMP TRIGGER reject_first_campaign BEFORE INSERT ON jobs WHEN NEW.repo_id=1 BEGIN SELECT RAISE(ABORT,'injected campaign failure'); END")?;
+			idle_campaign(tx, 2, &ReviewPolicy::default(), 0, false)?;
+			tx.execute_batch("CREATE TEMP TRIGGER reject_first_campaign BEFORE UPDATE OF state ON review_campaigns WHEN NEW.repo_id=1 BEGIN SELECT RAISE(ABORT,'injected campaign failure'); END")?;
 			Ok(first)
 		})
 	}).unwrap();
 	let report = campaign::tick(&db, 1).unwrap();
 	assert_eq!(report.failed, 1);
-	assert_eq!(report.enqueued, 1);
+	assert_eq!(report.completed, 1);
+	assert_eq!(report.enqueued, 0);
 	db.with_conn(|c| {
 		assert_eq!(campaigns::get(c, first)?.unwrap().state, campaigns::State::Active);
 		let first_jobs: i64 =
@@ -617,7 +678,8 @@ fn tick_rolls_back_a_failed_campaign_and_still_processes_other_repositories() {
 	.unwrap();
 	let report = campaign::tick(&db, 2).unwrap();
 	assert_eq!(report.failed, 0);
-	assert_eq!(report.enqueued, 1);
+	assert_eq!(report.completed, 1);
+	assert_eq!(report.enqueued, 0);
 }
 
 #[test]

@@ -378,7 +378,7 @@ fn campaign_snapshots_stay_scoped_and_survive_generation_purge() {
 		}
 		let summary=c::summarize(tx,1)?;
 		let counts:serde_json::Value=serde_json::from_str(summary.counts.expose()).unwrap();
-		assert_eq!(counts,serde_json::json!({"jobs":[{"kind":"survey","state":"queued","count":2}],"leads":{"status":{"open":1},"disposition":{}},"findings":{"pending":1},"verdicts":{"confirmed":1}}));
+		assert_eq!(counts,serde_json::json!({"jobs":[{"kind":"survey","state":"queued","count":2}],"leads":{"status":{"open":1},"disposition":{}},"findings":{"pending":1},"verdicts":{"confirmed":1},"pending_work":{"leads":[],"findings":[],"exact_batches":[],"unit_holds":[]}}));
 		c::finish(tx,1,&summary,&reason(),1)?;
 		tx.execute("DELETE FROM review_generations WHERE generation_id=11",[])?;
 		let campaign=c::get(tx,1)?.unwrap();

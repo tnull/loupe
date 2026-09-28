@@ -2,6 +2,33 @@ use loupe_server::review::policy::ReviewPolicy;
 use loupe_server::FileConfig;
 
 #[test]
+fn startup_always_validates_v2_reserves_even_without_new_toml_keys() {
+	let config: FileConfig = toml::from_str("[review]\ncampaign_max_jobs=3").unwrap();
+	assert!(
+		config.review.resolve().is_err(),
+		"V2 startup must reject defaults that overcommit a small campaign budget"
+	);
+}
+
+#[test]
+fn app_state_always_validates_v2_reserves() {
+	let state = loupe_server::AppState::new(
+		std::sync::Arc::new(
+			loupe_storage::Db::open_in_memory(&loupe_storage::secrets::MasterKey::for_tests())
+				.unwrap(),
+		),
+		std::sync::Arc::new(loupe_tls::Ca::new("policy-test").unwrap()),
+		std::sync::Arc::new(loupe_server::reporters::GithubReporter::new().unwrap()),
+	);
+	assert!(
+		state
+			.with_review_policy(ReviewPolicy { campaign_max_jobs: 3, ..ReviewPolicy::default() })
+			.is_err(),
+		"AppState must enforce the same V2 admission policy as startup"
+	);
+}
+
+#[test]
 fn review_toml_accepts_v2_admission_keys() {
 	let parsed = toml::from_str::<FileConfig>(
 		"[review]\nmax_units_per_survey=32\nmax_leads_per_survey=16\nmax_sibling_leads_per_drilldown=4\ncampaign_urgent_reserve=4\ncampaign_verification_reserve=4\n",
@@ -34,14 +61,14 @@ fn v2_snapshots_freeze_admission_without_changing_v1_bytes() {
 }
 
 #[test]
-fn v2_validation_is_explicit_and_does_not_import_legacy_reserve() {
+fn v2_startup_validation_does_not_import_legacy_reserve() {
 	let mut small = ReviewPolicy { campaign_max_jobs: 3, ..ReviewPolicy::default() };
 	assert!(small.snapshot().is_ok());
 	assert!(small.snapshot_v2().is_err());
 	let old_config: FileConfig = toml::from_str("[review]\ncampaign_max_jobs=3").unwrap();
 	assert!(
-		old_config.review.resolve().is_ok(),
-		"inert rollout must preserve old small-cap configurations"
+		old_config.review.resolve().is_err(),
+		"V2 creation requires explicitly fitting protected reserves for small caps"
 	);
 	small.campaign_max_jobs = 1;
 	small.campaign_urgent_reserve = 0;

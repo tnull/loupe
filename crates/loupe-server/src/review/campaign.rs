@@ -1,11 +1,13 @@
 //! Transactional campaign orchestration. Worker checkout pins the commit.
-use loupe_core::text::policy::{Payload, Reason};
+use loupe_core::text::policy::Reason;
 use loupe_core::text::{BoundedJson, BoundedText};
 use loupe_core::{JobKind, JobState, WORKFLOW_CONTRACT_VERSION};
-use loupe_storage::scheduler::{self, Band, CampaignPolicy, NewPhaseJob};
+use loupe_storage::admission::{self, CapacityRefusal, Selection};
+use loupe_storage::admission_policy::CampaignPolicyV2;
+use loupe_storage::review_intents::BlockReason;
 use loupe_storage::{
-	campaigns, generations, jobs, review_units, transaction, Conflict, Db, Entity, Error,
-	Ownership, Result,
+	admission_claim, campaign_work, campaigns, generations, jobs, scheduler, transaction, Conflict,
+	Db, Entity, Error, Ownership, Result,
 };
 use rusqlite::{params, OptionalExtension, Transaction};
 
@@ -48,22 +50,30 @@ pub struct OpenCampaign<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opened {
-	Created { campaign_id: i64, job_id: i64 },
-	Coalesced { campaign_id: i64 },
-	Pending { campaign_id: i64 },
+	Created {
+		campaign_id: i64,
+		job_id: i64,
+	},
+	Coalesced {
+		campaign_id: i64,
+	},
+	Pending {
+		campaign_id: i64,
+	},
+	/// Known B8-only work is retained without a preparation job or budget charge.
+	Deferred {
+		campaign_id: i64,
+	},
 }
 
 fn get(tx: &Transaction<'_>, id: i64) -> Result<campaigns::Campaign> {
 	campaigns::get(tx, id)?.ok_or(Error::NotFound(Entity::Campaign, id))
 }
 
-fn recipe(name: &str) -> Result<BoundedJson<Payload>> {
-	Ok(BoundedJson::new(&serde_json::json!({"version":1,"phase":"survey","recipe":name,"assignment_key":"ordinary"}).to_string())?)
-}
-
 pub fn open(
 	tx: &Transaction<'_>, new: &OpenCampaign<'_>, policy: &ReviewPolicy, now: i64,
 ) -> Result<Opened> {
+	policy.validate_v2().map_err(|_| Error::Conflict(Conflict::CampaignPolicy))?;
 	let active: Option<i64> = tx
 		.query_row(
 			"SELECT campaign_id FROM review_campaigns WHERE repo_id=?1 AND state='active'",
@@ -101,19 +111,32 @@ pub fn open(
 		generations::set_pending_follow_up(tx, generation_id, &pending)?;
 		return Ok(Opened::Coalesced { campaign_id });
 	}
-	let has_baseline: bool = tx.query_row(
-		"SELECT EXISTS(SELECT 1 FROM review_generations WHERE repo_id=?1 AND state='active')",
+	let baseline: Option<String> = tx.query_row(
+		"SELECT generation_commit_sha FROM review_generations WHERE repo_id=?1 AND state='active'",
 		[new.repo_id],
 		|r| r.get(0),
-	)?;
-	let initial = if !has_baseline {
+	).optional()?;
+	let known_successor = match new.requested_ref {
+		RequestedRef::Pinned(sha) => {
+			if !loupe_core::inventory_manifest::is_git_oid(sha) {
+				return Err(loupe_core::text::Error::new(
+					"commit_sha",
+					loupe_core::text::Rule::Identifier,
+				)
+				.into());
+			}
+			baseline.as_ref().is_some_and(|base| base != sha)
+		},
+		RequestedRef::Branch(_) => false,
+	};
+	let initial = if baseline.is_none() {
 		campaigns::Recipe::Bootstrap
 	} else if new.kind_hint == KindHint::FullReview {
 		campaigns::Recipe::Reconciliation
 	} else {
 		campaigns::Recipe::Incremental
 	};
-	let snapshot = policy.snapshot().map_err(|_| Error::Conflict(Conflict::CampaignPolicy))?;
+	let snapshot = policy.snapshot_v2().map_err(|_| Error::Conflict(Conflict::CampaignPolicy))?;
 	let deadline = now
 		.checked_add(policy.campaign_deadline_seconds)
 		.ok_or(Error::Conflict(Conflict::CampaignPolicy))?;
@@ -133,26 +156,20 @@ pub fn open(
 		},
 		now,
 	)?;
-	let recipe = recipe(initial.as_str())?;
-	let job_id = scheduler::enqueue_phase(
-		tx,
-		&NewPhaseJob {
-			repo_id: new.repo_id,
-			kind: JobKind::Survey,
+	if initial == campaigns::Recipe::Reconciliation || known_successor {
+		let summary = campaigns::summarize(tx, campaign_id)?;
+		campaigns::finish(
+			tx,
 			campaign_id,
-			generation_id: None,
-			assigned_lead_id: None,
-			target_finding_id: None,
-			continuation_of_job_id: None,
-			band: Band::Normal,
-			effective_priority: 0,
-			eligible_at: now,
-			token_budget: policy.survey_token_budget,
-			recipe: &recipe,
-			handoff: false,
-		},
-		now,
-	)?;
+			&summary,
+			&BoundedText::new("unsupported_recipe")?,
+			now,
+		)?;
+		return Ok(Opened::Deferred { campaign_id });
+	}
+	// Charge the single preparation job before the first lease. Branch names
+	// remain unresolved until the checkout owner pins the target.
+	let job_id = admission_claim::create_preparation(tx, campaign_id, now)?;
 	if let RequestedRef::Pinned(sha) = new.requested_ref {
 		pin(tx, campaign_id, job_id, sha, now)?;
 	}
@@ -230,6 +247,11 @@ pub fn pin(
 		params![campaign_id, sha, generation_id],
 	)?;
 	tx.execute("UPDATE jobs SET generation_id=?2 WHERE id=?1", params![job_id, generation_id])?;
+	// A leased host request has its own uniform readiness/authorization denial.
+	// Creation must validate reused ready state before committing the queued job.
+	if job.state == JobState::Queued && active.is_some_and(|g| g.generation_id == generation_id) {
+		campaign_work::validate_ready_job(tx, job_id)?;
+	}
 	Ok(generation_id)
 }
 
@@ -253,75 +275,17 @@ pub fn activate_generation(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> 
 	generations::activate(tx, id, now)
 }
 
-enum Replenished {
-	Queued(i64),
-	NotNeeded,
-	BudgetExhausted,
-}
-
-pub fn replenish(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Option<i64>> {
-	Ok(match replenish_inner(tx, campaign_id, now)? {
-		Replenished::Queued(id) => Some(id),
-		Replenished::NotNeeded | Replenished::BudgetExhausted => None,
-	})
-}
-
-fn replenish_inner(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Replenished> {
-	let campaign = get(tx, campaign_id)?;
-	if campaign.state != campaigns::State::Active
-		|| campaign.deadline_at.is_some_and(|at| at <= now)
-	{
-		return Ok(Replenished::NotNeeded);
-	}
-	let Some(generation_id) = campaign.generation_id else {
-		return Ok(Replenished::NotNeeded);
-	};
-	let generation = generations::get(tx, generation_id)?
-		.ok_or(Error::NotFound(Entity::Generation, generation_id))?;
-	if generation.state != generations::State::Active {
-		return Ok(Replenished::NotNeeded);
-	}
-	let queued:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE campaign_id=?1 AND kind='survey' AND state='queued')",[campaign_id],|r|r.get(0))?;
-	if queued {
-		return Ok(Replenished::NotNeeded);
-	}
-	let band:Option<String>=tx.query_row(&format!("SELECT u.priority_band FROM review_units u JOIN review_generations g ON g.generation_id=u.generation_id WHERE u.generation_id=?1 AND {} ORDER BY CASE u.priority_band WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END LIMIT 1",*review_units::UNIT_NEEDS_WORK),[generation_id],|r|r.get(0)).optional()?;
-	let Some(band) = band else {
-		return Ok(Replenished::NotNeeded);
-	};
-	let band: Band = band.parse()?;
-	let parent:Option<i64>=tx.query_row("SELECT id FROM jobs WHERE campaign_id=?1 AND kind='survey' AND state IN ('succeeded','failed','cancelled') ORDER BY finished_at DESC,id DESC LIMIT 1",[campaign_id],|r|r.get(0)).optional()?;
-	let policy = CampaignPolicy::from_snapshot(&campaign.effective_policy)?;
-	let recipe = recipe("coverage")?;
-	match scheduler::enqueue_phase(
-		tx,
-		&NewPhaseJob {
-			repo_id: campaign.repo_id,
-			kind: JobKind::Survey,
-			campaign_id,
-			generation_id: Some(generation_id),
-			assigned_lead_id: None,
-			target_finding_id: None,
-			continuation_of_job_id: parent,
-			band,
-			effective_priority: 0,
-			eligible_at: now,
-			token_budget: policy.survey_token_budget,
-			recipe: &recipe,
-			handoff: false,
-		},
-		now,
-	) {
-		Ok(id) => Ok(Replenished::Queued(id)),
-		Err(Error::Conflict(Conflict::CampaignBudget)) => Ok(Replenished::BudgetExhausted),
-		Err(error) => Err(error),
-	}
+/// Compatibility hook: coverage is materialized only when it wins first claim.
+/// Observing ordinary work cannot reserve a child or consume budget.
+pub fn replenish(_tx: &Transaction<'_>, _campaign_id: i64, _now: i64) -> Result<Option<i64>> {
+	Ok(None)
 }
 
 pub fn cancel(
 	tx: &Transaction<'_>, campaign_id: i64, reason: &BoundedText<Reason>, now: i64,
 ) -> Result<()> {
 	scheduler::cancel_queued_children(tx, campaign_id, now, reason)?;
+	campaign_work::block_all(tx, campaign_id, BlockReason::CampaignCancelled, now)?;
 	campaigns::cancel(tx, campaign_id, reason, now)
 }
 
@@ -343,7 +307,6 @@ pub struct TickReport {
 
 #[derive(Default)]
 struct Progress {
-	enqueued: bool,
 	finish: Option<Finish>,
 	budget_exhausted: bool,
 }
@@ -352,20 +315,64 @@ pub fn try_finish(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Op
 	Ok(advance(tx, campaign_id, now)?.finish)
 }
 
+fn frozen_budget(
+	tx: &Transaction<'_>, campaign: i64,
+) -> Result<(CampaignPolicyV2, admission::Spending)> {
+	let policy = admission::load_policy(tx, campaign)?;
+	let spending =
+		admission::get_spending(tx, campaign)?.ok_or(Error::Conflict(Conflict::CampaignPolicy))?;
+	admission::choose_pool(&policy, spending, admission::WorkClass::Survey)?;
+	Ok((policy, spending))
+}
+
 fn advance(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Progress> {
-	let campaign = get(tx, campaign_id)?;
+	// Lifecycle decisions do not deserialize model prose or historical policy.
+	let (state, recipe, deadline): (String, String, Option<i64>) = tx
+		.query_row(
+			"SELECT state,recipe,deadline_at FROM review_campaigns WHERE campaign_id=?1",
+			[campaign_id],
+			|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+		)
+		.optional()?
+		.ok_or(Error::NotFound(Entity::Campaign, campaign_id))?;
 	let mut progress = Progress::default();
-	if campaign.state != campaigns::State::Active {
+	if state != "active" {
 		return Ok(progress);
 	}
-	let expired = campaign.deadline_at.is_some_and(|at| at <= now);
-	if expired {
+	let expired = deadline.is_some_and(|at| at <= now);
+	let mut terminal_reason = if expired {
+		Some(BlockReason::CampaignDeadline)
+	} else if !matches!(recipe.as_str(), "bootstrap" | "incremental") {
+		Some(BlockReason::UnsupportedRecipe)
+	} else {
+		None
+	};
+	let budget = if terminal_reason.is_none() {
+		match frozen_budget(tx, campaign_id) {
+			Ok(budget) => Some(budget),
+			Err(Error::Conflict(Conflict::CampaignPolicy))
+			| Err(Error::Sqlite(
+				rusqlite::Error::InvalidColumnType(..)
+				| rusqlite::Error::FromSqlConversionFailure(..),
+			)) => {
+				// Only incompatible frozen policy/accounting is held; unexpected
+				// database failures still roll back this campaign transaction.
+				terminal_reason = Some(BlockReason::CompatibilityPolicy);
+				None
+			},
+			Err(error) => return Err(error),
+		}
+	} else {
+		None
+	};
+	if let Some(reason) = terminal_reason {
 		scheduler::cancel_queued_children(
 			tx,
 			campaign_id,
 			now,
-			&BoundedText::new("campaign deadline")?,
+			&BoundedText::new(reason.as_str())?,
 		)?;
+		campaign_work::block_all(tx, campaign_id, reason, now)?;
 	}
 	let busy: bool = tx.query_row(
 		"SELECT EXISTS(SELECT 1 FROM jobs WHERE campaign_id=?1 AND state IN ('queued','leased'))",
@@ -375,22 +382,53 @@ fn advance(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Progress>
 	if busy {
 		return Ok(progress);
 	}
-	if !expired {
-		match replenish_inner(tx, campaign_id, now)? {
-			Replenished::Queued(_) => {
-				progress.enqueued = true;
-				return Ok(progress);
-			},
-			Replenished::BudgetExhausted => progress.budget_exhausted = true,
-			Replenished::NotNeeded => {},
+	if let Some((policy, spending)) = budget {
+		let mut fundable = false;
+		for group in campaign_work::pending(tx, campaign_id, deadline)? {
+			let reason = if !group.before_deadline {
+				Some(BlockReason::CampaignDeadline)
+			} else {
+				match admission::choose_pool(&policy, spending, group.work_class())? {
+					Selection::Pool(_) => {
+						fundable = true;
+						None
+					},
+					Selection::Refused(CapacityRefusal::CampaignBudget) => {
+						progress.budget_exhausted = true;
+						Some(BlockReason::CampaignBudget)
+					},
+					Selection::Refused(CapacityRefusal::ProtectedCapacity) => {
+						Some(BlockReason::ProtectedCapacity)
+					},
+				}
+			};
+			if let Some(reason) = reason {
+				campaign_work::block_pending(tx, campaign_id, group, deadline, reason, now)?;
+				terminal_reason.get_or_insert(reason);
+			}
+		}
+		if fundable {
+			return Ok(progress);
 		}
 	}
+	campaign_work::block_unexplained(tx, campaign_id, now)?;
+	let summary = campaigns::summarize(tx, campaign_id)?;
 	let (finish, reason) = if expired {
 		(Finish::DeadlineReached, "deadline")
 	} else {
-		(Finish::Completed, "completed")
+		(
+			Finish::Completed,
+			terminal_reason.map(BlockReason::as_str).unwrap_or(
+				if summary.coverage == generations::Coverage::Complete
+					&& !campaign_work::has_unfinished(tx, campaign_id)?
+				{
+					"completed"
+				} else {
+					"partial"
+				},
+			),
+		)
 	};
-	let summary = campaigns::summarize(tx, campaign_id)?;
 	campaigns::finish(tx, campaign_id, &summary, &BoundedText::new(reason)?, now)?;
 	progress.finish = Some(finish);
 	Ok(progress)
@@ -418,7 +456,6 @@ pub fn tick(db: &Db, now: i64) -> Result<TickReport> {
 				continue;
 			},
 		};
-		report.enqueued += usize::from(progress.enqueued);
 		match progress.finish {
 			Some(Finish::Completed) => report.completed += 1,
 			Some(Finish::DeadlineReached) => report.deadline_reached += 1,
@@ -427,7 +464,7 @@ pub fn tick(db: &Db, now: i64) -> Result<TickReport> {
 		if progress.budget_exhausted {
 			report.budget_exhausted += 1;
 			// The finish committed above; subsequent ticks cannot log this again.
-			tracing::info!(campaign_id, "campaign survey budget exhausted with uncovered units");
+			tracing::info!(campaign_id, "campaign budget exhausted with retained unfinished work");
 		}
 	}
 	Ok(report)

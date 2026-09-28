@@ -58,7 +58,6 @@ async fn phase_advertisements_do_not_open_public_runtime_gates() {
 	use loupe_proto::review_lease::{LeaseList, ReviewCapability};
 	use loupe_server::review::campaign;
 	use loupe_server::review::policy::ReviewPolicy;
-	use loupe_storage::scheduler::{self, Band, NewPhaseJob};
 	let f = bring_up_with_repo_and_worker().await;
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
 		as i64;
@@ -76,12 +75,10 @@ async fn phase_advertisements_do_not_open_public_runtime_gates() {
 		let mut ids=vec![job_id];
 		for kind in [JobKind::Drilldown,JobKind::Verify] {
 			let recipe=BoundedJson::<Payload>::new(&serde_json::json!({"version":1,"phase":kind.as_str()}).to_string())?;
-			ids.push(scheduler::enqueue_phase(tx,&NewPhaseJob {
-				repo_id:f.repo_id,kind:kind.clone(),campaign_id,generation_id:Some(generation_id),
-				assigned_lead_id:(kind==JobKind::Drilldown).then_some(lead_id),
-				target_finding_id:(kind==JobKind::Verify).then_some(finding_id),continuation_of_job_id:None,
-				band:Band::Urgent,effective_priority:100,eligible_at:now,token_budget:None,recipe:&recipe,handoff:true,
-			},now)?);
+			// Explicit adversarial queued rows test the closed public gate;
+			// these are not the production V2 first-claim materialization path.
+			tx.execute("INSERT INTO jobs(repo_id,kind,state,campaign_id,generation_id,assigned_lead_id,target_finding_id,scheduling_band,effective_priority,eligible_at,recipe,workflow_contract_version,enqueued_at) VALUES(?1,?2,'queued',?3,?4,?5,?6,'urgent',100,?7,?8,1,?7)",rusqlite::params![f.repo_id,kind.as_str(),campaign_id,generation_id,(kind==JobKind::Drilldown).then_some(lead_id),(kind==JobKind::Verify).then_some(finding_id),now,recipe.expose()])?;
+			ids.push(tx.last_insert_rowid());
 		}
 		Ok(ids)
 	})).unwrap();

@@ -123,7 +123,11 @@ async fn leads_preserve_typed_evidence_intent_priority_and_replay_without_spend(
 	assert!(attached["observation_id"].is_i64());
 	assert_eq!(attached["accepted_priority"], first["accepted_priority"]);
 	assert_eq!(rows(&f, "jobs"), 1);
-	assert_eq!(rows(&f, "job_admission_charges"), 0);
+	assert_eq!(
+		rows(&f, "job_admission_charges"),
+		1,
+		"only the original preparation charge; accepted evidence and replay add none"
+	);
 	assert_eq!(rows(&f, "lead_drilldown_intents"), 1);
 	assert_eq!(count(&f, Operation::SubmitLead), 2);
 	let mut divergent = payload;

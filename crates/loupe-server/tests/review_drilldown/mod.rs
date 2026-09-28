@@ -38,7 +38,7 @@ pub(super) async fn ready_fixture(f: Fixture) -> (Fixture, i64, i64) {
 	f.state.db.with_conn(|conn| {
 		let policy = ReviewPolicy::default().snapshot_v2().unwrap();
 		conn.execute("UPDATE review_campaigns SET effective_policy=?2,effective_policy_digest=?3 WHERE campaign_id=?1",params![f.campaign,policy.expose(),policy.digest().as_slice()])?;
-		conn.execute("INSERT INTO campaign_admission_spending(campaign_id,policy_version,general_spent) VALUES(?1,2,1)",[f.campaign])?;
+		assert_eq!(conn.query_row("SELECT general_spent FROM campaign_admission_spending WHERE campaign_id=?1",[f.campaign],|r|r.get::<_,i64>(0))?,1);
 		Ok(())
 	}).unwrap();
 	let (f, lead) = child(&f, generation, f.job, "allocation boundary").await;
