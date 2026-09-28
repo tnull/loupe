@@ -36,6 +36,9 @@ mod survey_terminal;
 #[path = "review_evidence/mod.rs"]
 mod evidence_checkpoints;
 
+#[path = "review_drilldown/mod.rs"]
+mod drilldown_terminal;
+
 struct Fixture {
 	state: AppState,
 	peer: PeerCert,

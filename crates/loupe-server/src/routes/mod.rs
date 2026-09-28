@@ -3,6 +3,7 @@ pub mod health;
 pub mod jobs;
 pub mod repos;
 pub mod review_context;
+pub mod review_drilldown;
 pub mod review_evidence;
 pub mod review_host;
 pub mod review_inventory;

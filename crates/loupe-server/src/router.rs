@@ -68,6 +68,7 @@ pub fn router(state: AppState) -> Router {
 			post(routes::review_evidence::submit_unit_result),
 		)
 		.route("/v1/jobs/{id}/finalize-survey", post(routes::review_survey::finalize))
+		.route("/v1/jobs/{id}/finalize-drilldown", post(routes::review_drilldown::finalize))
 		.route("/v1/jobs/{id}/limits", get(routes::review_context::limits))
 		.route("/v1/jobs/{id}/lead-candidates", get(routes::review_context::candidates))
 		.route_layer(axum::middleware::from_fn(auth::require_worker));
