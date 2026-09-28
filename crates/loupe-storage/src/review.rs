@@ -43,6 +43,8 @@ pub enum Conflict {
 	Corroboration,
 	LeadState,
 	Checkpoint,
+	CheckpointLimit,
+	Candidate,
 	TerminalReceipt,
 	FindingIdentity(i64),
 	FindingDetails,
@@ -51,6 +53,7 @@ pub enum Conflict {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ownership {
+	Candidate,
 	CampaignRoot,
 	CampaignContinuation,
 	CampaignGeneration,

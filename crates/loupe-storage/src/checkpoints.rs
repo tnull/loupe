@@ -5,7 +5,16 @@ use rusqlite::{params, OptionalExtension, Transaction};
 
 use crate::review::{is_unique, parsed, standalone, string_enum};
 use crate::{Conflict, Error, Result};
-string_enum!(Operation { SubmitReviewUnit=>"submit_review_unit", SubmitLead=>"submit_lead", SubmitUnitResult=>"submit_unit_result", SubmitObservation=>"submit_observation", StageArtifact=>"stage_proof_artifact", RecordExecution=>"record_execution", ValidateFixPatch=>"validate_fix_patch", SubmitSiblingLead=>"submit_sibling_lead", InitializeSurveyBatch=>"initialize_survey_batch", PublishProfile=>"publish_profile" });
+string_enum!(Operation { SubmitReviewUnit=>"submit_review_unit", SubmitLead=>"submit_lead", SubmitUnitResult=>"submit_unit_result", SubmitObservation=>"submit_observation", StageArtifact=>"stage_proof_artifact", RecordExecution=>"record_execution", ValidateFixPatch=>"validate_fix_patch", SubmitSiblingLead=>"submit_sibling_lead", InitializeSurveyBatch=>"initialize_survey_batch", PublishProfile=>"publish_profile", IssueDuplicateCandidates=>"issue_duplicate_candidates" });
+
+/// Accepted fresh operations for this logical job, not just its current lease.
+pub fn accepted_count(tx: &Transaction<'_>, job: i64, operation: Operation) -> Result<i64> {
+	Ok(tx.query_row(
+		"SELECT COUNT(*) FROM job_checkpoints WHERE job_id=?1 AND operation=?2",
+		params![job, operation.as_str()],
+		|row| row.get(0),
+	)?)
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Recorded {
 	Recorded,

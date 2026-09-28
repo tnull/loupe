@@ -51,6 +51,7 @@ impl From<loupe_storage::Error> for ApiError {
 			Error::Ownership(_) | Error::NotFound(_, _) => Self::denied(),
 			Error::Conflict(Conflict::Checkpoint) => Self::conflict("checkpoint_conflict"),
 			Error::Conflict(Conflict::InventoryLimit) => Self::conflict("inventory_limit"),
+			Error::Conflict(Conflict::CheckpointLimit) => Self::conflict("checkpoint_limit"),
 			Error::Conflict(Conflict::CampaignPinned) => Self::conflict("checkout_conflict"),
 			Error::Conflict(_) => Self::conflict("state_conflict"),
 			Error::Validation(error) => Self::invalid(error),
@@ -103,6 +104,8 @@ pub fn is_phase_route(path: &str) -> bool {
 			| "/v1/jobs/{id}/inventory-batches"
 			| "/v1/jobs/{id}/seal-inventory"
 			| "/v1/jobs/{id}/publish-profile"
+			| "/v1/jobs/{id}/limits"
+			| "/v1/jobs/{id}/lead-candidates"
 	)
 }
 
@@ -152,6 +155,16 @@ pub async fn json<T: DeserializeOwned>(
 		.await
 		.map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"))?;
 	serde_json::from_slice(&bytes).map_err(ApiError::invalid)
+}
+
+pub async fn no_body(headers: &HeaderMap, body: Body) -> Result<()> {
+	require_version(headers)?;
+	if headers.get_all(header::CONTENT_ENCODING).iter().any(|value| value.as_bytes() != b"identity")
+	{
+		return Err(ApiError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, "content_encoding"));
+	}
+	to_bytes(body, 0).await.map_err(|_| ApiError::invalid("this operation has no request body"))?;
+	Ok(())
 }
 
 pub fn authorize<'tx, 'conn>(

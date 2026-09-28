@@ -21,6 +21,9 @@ use tower::Service;
 const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const NEXT_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+#[path = "review_context/mod.rs"]
+mod context;
+
 struct Fixture {
 	state: AppState,
 	peer: PeerCert,

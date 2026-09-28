@@ -11,6 +11,59 @@ use crate::review_lease::{
 };
 use crate::PROTOCOL_VERSION;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Capacity {
+	pub limit: u32,
+	pub remaining: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseLimitsResponse {
+	pub protocol_version: ReviewProtocol,
+	pub soft_deadline_at: i64,
+	pub submit_by: i64,
+	pub hard_deadline_at: i64,
+	pub remaining_seconds: u64,
+	pub new_units: Capacity,
+	pub leads: Capacity,
+	pub siblings: Capacity,
+	pub candidate_queries: Capacity,
+	pub campaign_jobs_limit: u64,
+	pub campaign_jobs_admitted: u64,
+	pub campaign_general_remaining: u64,
+	pub campaign_urgent_remaining: u64,
+	pub campaign_verification_remaining: u64,
+	pub proof_capacity: Unavailable,
+	pub artifact_capacity: Unavailable,
+	pub output_capacity: Unavailable,
+	pub tokens: TokenCapacity,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unavailable {
+	Unavailable,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TokenCapacity {
+	None,
+	HostEnforced { limit: u64, spent: UnknownSpend },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownSpend {
+	Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidatesResponse {
+	pub protocol_version: ReviewProtocol,
+	pub candidates: LeaseList<loupe_core::review_candidates::Candidate, 20>,
+}
+
 /// New phase requests always carry the exact protocol version, in addition
 /// to the required HTTP header. Legacy request policy is unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
