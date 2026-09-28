@@ -173,7 +173,10 @@ impl Lease<'_, '_> {
 			&format!("SELECT EXISTS(SELECT 1 FROM review_units u JOIN review_generations g ON g.generation_id=u.generation_id
 			 WHERE u.review_unit_id=?1 AND u.generation_id=?2 AND {membership}
 			 AND u.assignment_epoch=?4 AND u.status='open' AND u.stale=0
-			 AND NOT EXISTS(SELECT 1 FROM review_unit_holds h WHERE h.review_unit_id=u.review_unit_id)
+			 AND NOT EXISTS(SELECT 1 FROM review_unit_holds h WHERE h.review_unit_id=u.review_unit_id
+			 AND NOT EXISTS(SELECT 1 FROM survey_continuation_batches b JOIN job_assigned_review_units a ON a.job_id=b.admitted_job_id
+			 WHERE b.batch_id=h.pending_batch_id AND b.generation_id=u.generation_id AND b.state='admitted' AND b.admitted_job_id=?3
+			 AND a.review_unit_id=u.review_unit_id AND a.position=h.batch_position AND a.assignment_epoch=?4))
 			 AND NOT EXISTS(SELECT 1 FROM job_assigned_review_units a JOIN jobs j ON j.id=a.job_id
 			 WHERE a.review_unit_id=u.review_unit_id AND a.job_id<>?3 AND j.state IN ('queued','leased'))
 			 AND NOT ({}))", review_units::UNIT_COVERED),

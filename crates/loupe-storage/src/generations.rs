@@ -139,10 +139,11 @@ pub fn set_coverage(tx: &Transaction<'_>, id: i64, coverage: Coverage) -> Result
 }
 pub fn coverage_rollup(tx: &Transaction<'_>, id: i64) -> Result<CoverageRollup> {
 	get(tx, id)?.ok_or(Error::NotFound(Entity::Generation, id))?;
-	let uncovered = format!("FROM review_units u JOIN review_generations g ON g.generation_id=u.generation_id WHERE u.generation_id=?1 AND u.status='open' AND NOT ({})", crate::review_units::UNIT_COVERED);
+	let held = "EXISTS(SELECT 1 FROM review_unit_holds h WHERE h.review_unit_id=u.review_unit_id)";
+	let uncovered = format!("FROM review_units u JOIN review_generations g ON g.generation_id=u.generation_id WHERE u.generation_id=?1 AND (u.status IN ('open','deferred') OR {held}) AND ({held} OR NOT ({}))", crate::review_units::UNIT_COVERED);
 	let missing_results =
 		tx.query_row(&format!("SELECT COUNT(*) {uncovered}"), [id], |r| r.get(0))?;
-	let needs_follow_up = tx.query_row(&format!("SELECT COUNT(*) {uncovered} AND (SELECT r.disposition FROM review_unit_results r WHERE r.review_unit_id=u.review_unit_id AND r.invalidated=0 AND r.commit_sha=g.generation_commit_sha AND r.profile_version=g.profile_version ORDER BY r.review_unit_result_id DESC LIMIT 1)='needs_follow_up'"),[id],|r|r.get(0))?;
+	let needs_follow_up = tx.query_row(&format!("SELECT COUNT(*) {uncovered} AND ({held} OR (SELECT r.disposition FROM review_unit_results r WHERE r.review_unit_id=u.review_unit_id AND r.invalidated=0 AND r.commit_sha=g.generation_commit_sha AND r.profile_version=g.profile_version ORDER BY r.review_unit_result_id DESC LIMIT 1)='needs_follow_up')"),[id],|r|r.get(0))?;
 	let unresolved_inventory = if inventory::manifest_sealed(tx, id)?.is_some() {
 		// Historical nonmembers are retained evidence targets, not entries in
 		// this manifest. Every persisted mapping must still name this source.
