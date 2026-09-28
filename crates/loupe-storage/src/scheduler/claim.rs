@@ -188,9 +188,31 @@ pub fn initialize_ordinary_batch(
 		return Err(Error::Conflict(crate::Conflict::Assignment));
 	}
 	let campaign_id = job.campaign_id.ok_or(Error::Conflict(crate::Conflict::Assignment))?;
+	let exact: Option<i64> = tx
+		.query_row(
+			"SELECT batch_id FROM survey_continuation_batches WHERE admitted_job_id=?1",
+			[job.id],
+			|row| row.get(0),
+		)
+		.optional()?;
+	if let Some(batch) = exact {
+		let units = crate::unit_holds::admit_exact_batch(tx, batch, job.id, now)?
+			.into_iter()
+			.filter(|a| !a.completed)
+			.map(|a| a.unit_id)
+			.collect();
+		return Ok(BatchInitialization { units, resumed: true });
+	}
 	let campaign =
 		campaigns::get(tx, campaign_id)?.ok_or(Error::NotFound(Entity::Campaign, campaign_id))?;
-	let policy = CampaignPolicy::from_snapshot(&campaign.effective_policy)?;
+	let version = serde_json::from_str::<serde_json::Value>(campaign.effective_policy.expose())
+		.map_err(|_| Error::Conflict(crate::Conflict::CampaignPolicy))?["version"]
+		.as_u64();
+	let survey_units_per_job = if version == Some(2) {
+		crate::admission::load_policy(tx, campaign_id)?.survey_units_per_job
+	} else {
+		CampaignPolicy::from_snapshot(&campaign.effective_policy)?.survey_units_per_job
+	};
 	let batch_exists: bool = tx.query_row(
 		"SELECT EXISTS(SELECT 1 FROM job_assigned_review_units WHERE job_id=?1)",
 		[job.id],
@@ -208,7 +230,7 @@ pub fn initialize_ordinary_batch(
 			now,
 			|tx| {
 				let units = tx.prepare(&format!("SELECT u.review_unit_id,u.assignment_epoch FROM review_units u JOIN review_generations g ON g.generation_id=u.generation_id WHERE u.generation_id=?1 AND {} ORDER BY CASE u.priority_band WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,u.created_at,u.review_unit_id LIMIT ?2",*review_units::UNIT_NEEDS_WORK))?
-					.query_map(params![generation,policy.survey_units_per_job],|r|Ok(review_units::Assignment{unit_id:r.get(0)?,expected_epoch:r.get(1)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+					.query_map(params![generation,survey_units_per_job],|r|Ok(review_units::Assignment{unit_id:r.get(0)?,expected_epoch:r.get(1)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
 				review_units::assign(tx, job.id, &units)?;
 				Ok(BoundedJson::new("{}")?)
 			},
