@@ -210,6 +210,9 @@ fn compact_title(raw: &str) -> String {
 }
 
 fn render_body(repo: &RepoRow, report_finding: &ReportFinding) -> String {
+	if report_finding.phase_review {
+		return render_phase_body(repo, report_finding);
+	}
 	let finding = &report_finding.finding;
 	let mut out = String::new();
 	out.push_str("## Finding\n\n");
@@ -253,13 +256,62 @@ fn render_body(repo: &RepoRow, report_finding: &ReportFinding) -> String {
 }
 
 fn render_location(finding: &Finding) -> Option<String> {
-	let path = finding.file_path.as_ref()?;
-	let suffix = match (finding.line_start, finding.line_end) {
-		(Some(start), Some(end)) if end != start => format!(":{start}-{end}"),
-		(Some(start), _) => format!(":{start}"),
-		_ => String::new(),
-	};
-	Some(format!("`{path}{suffix}`"))
+	Some(format!("`{}`", super::finding_location(finding)?))
+}
+
+/// The delimiter exceeds every backtick run in the value, including runs
+/// on otherwise valid fence-closing lines. The language is trusted template text.
+fn literal_block(value: &str, language: &str) -> String {
+	let fence = "`".repeat(backtick_run(value).saturating_add(1).max(3));
+	let newline = if value.ends_with('\n') { "" } else { "\n" };
+	format!("{fence}{language}\n{value}{newline}{fence}\n")
+}
+
+fn backtick_run(value: &str) -> usize {
+	value.as_bytes().split(|byte| *byte != b'`').map(<[u8]>::len).max().unwrap_or(0)
+}
+
+fn literal_inline(value: &str) -> Option<String> {
+	// Code spans normalize line endings and boundary spaces. Use a block
+	// whenever an inline representation would lose that literal content.
+	if value.is_empty()
+		|| value.contains(['\r', '\n', '\t'])
+		|| value.starts_with(' ')
+		|| value.ends_with(' ')
+	{
+		return None;
+	}
+	let delimiter = "`".repeat(backtick_run(value).saturating_add(1));
+	let padding = if value.starts_with('`') || value.ends_with('`') { " " } else { "" };
+	Some(format!("{delimiter}{padding}{value}{padding}{delimiter}"))
+}
+
+fn render_phase_body(repo: &RepoRow, report: &ReportFinding) -> String {
+	let mut out = String::from("## Finding\n\n");
+	for (label, value) in report.phase_fields(repo) {
+		out.push_str(&format!("**{label}:**"));
+		if let Some(inline) = literal_inline(&value) {
+			out.push_str(&format!(" {inline}\n\n"));
+		} else {
+			out.push_str("\n\n");
+			out.push_str(&literal_block(&value, ""));
+			out.push('\n');
+		}
+	}
+	for (heading, value, language) in [
+		("Description", Some(&report.finding.description), ""),
+		("Proof of Concept", report.finding.poc_unified.as_ref(), "diff"),
+		("Suggested Fix", report.finding.patch_unified.as_ref(), "diff"),
+	] {
+		if let Some(value) = value {
+			out.push_str(&format!("## {heading}\n\n"));
+			out.push_str(&literal_block(value, language));
+			out.push('\n');
+		}
+	}
+	// Rendering existing fields does not authorize new proof/patch submissions.
+	out.push_str("_This finding was discovered by [Project Loupe](https://github.com/project-loupe/loupe)._\n");
+	out
 }
 
 #[cfg(test)]
@@ -334,7 +386,11 @@ mod tests {
 	fn body_describes_one_finding_not_a_scan_batch() {
 		let body = render_body(
 			&repo(),
-			&ReportFinding { finding: finding(), reviewed_revision: Some("abc123".into()) },
+			&ReportFinding {
+				finding: finding(),
+				reviewed_revision: Some("abc123".into()),
+				phase_review: false,
+			},
 		);
 		assert!(body.starts_with("## Finding\n\n"));
 		assert!(body.contains("- repo: `acme/widget` (`https://github.com/acme/widget.git`)"));
@@ -350,5 +406,119 @@ mod tests {
 		assert!(!body.contains("This issue tracks one loupe finding"));
 		assert!(!body.contains("finished a scan"));
 		assert!(!body.contains("Findings:"));
+	}
+
+	#[test]
+	fn phase_report_cannot_inject_markdown_structure() {
+		use pulldown_cmark::{Event, Parser, Tag};
+		let hostile = "[link](https://attacker.invalid) ![image](https://attacker.invalid/i)\n\n# forged heading\n\n- forged list\n\n<script>attack()</script>\n\n```\n```diff\n";
+		let mut f = finding();
+		f.title = hostile.into();
+		f.description = hostile.into();
+		f.file_path = Some("src/` [path](https://attacker.invalid)\n# forged.rs".into());
+		f.scanner_id = hostile.into();
+		f.fingerprint = hostile.into();
+		f.cwe = Some(hostile.into());
+		f.poc_unified = Some(hostile.into());
+		f.patch_unified = Some(hostile.into());
+		let mut r = repo();
+		r.owner = hostile.into();
+		r.repo = hostile.into();
+		r.clone_url = hostile.into();
+		let report = ReportFinding {
+			finding: f.clone(),
+			reviewed_revision: Some(hostile.into()),
+			phase_review: true,
+		};
+		let body = render_body(&r, &report);
+		let mut links = Vec::new();
+		let mut headings = 0;
+		for event in Parser::new(&body) {
+			match event {
+				Event::Start(Tag::Link { dest_url, .. }) => links.push(dest_url.to_string()),
+				Event::Start(Tag::Image { .. } | Tag::List(_) | Tag::BlockQuote(_))
+				| Event::Rule
+				| Event::Html(_)
+				| Event::InlineHtml(_) => {
+					panic!("phase values must remain literal, not active Markdown/HTML: {event:?}")
+				},
+				Event::Start(Tag::Heading { .. }) => headings += 1,
+				_ => {},
+			}
+		}
+		assert_eq!(
+			links,
+			["https://github.com/project-loupe/loupe"],
+			"phase fields cannot create links"
+		);
+		assert_eq!(headings, 4, "only trusted report headings are present");
+		let literals = literal_values(&body);
+		for (_, value) in report.phase_fields(&r) {
+			assert!(
+				literals
+					.iter()
+					.any(|literal| literal == &value || literal == &format!("{value}\n")),
+				"report must preserve literal field {value:?}"
+			);
+		}
+		assert_eq!(
+			literals.iter().filter(|value| value.as_str() == hostile).count(),
+			9,
+			"metadata, description and attachments all preserve their literal text"
+		);
+		assert_eq!(report.finding, f, "rendering must not rewrite evidence");
+	}
+
+	fn literal_values(body: &str) -> Vec<String> {
+		use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+		let mut values = Vec::new();
+		let mut block = None::<String>;
+		for event in Parser::new(body) {
+			match event {
+				Event::Code(value) => values.push(value.into_string()),
+				Event::Start(Tag::CodeBlock(_)) => block = Some(String::new()),
+				Event::Text(value) if block.is_some() => block.as_mut().unwrap().push_str(&value),
+				Event::End(TagEnd::CodeBlock) => values.push(block.take().unwrap()),
+				_ => {},
+			}
+		}
+		values
+	}
+
+	#[test]
+	fn phase_location_and_description_preserve_delimiters_and_whitespace() {
+		for path in [
+			"src/lib.rs",
+			"src/`one``two.rs",
+			"`surrounded`",
+			" leading and trailing ",
+			"src/line\n# heading.rs",
+			"src/tab\tfile.rs",
+			"src/cafe\u{301}.rs",
+		] {
+			let mut f = finding();
+			f.file_path = Some(path.into());
+			f.description = "```\n``````\n~~~\n# literal\n".into();
+			f.poc_unified = None;
+			f.patch_unified = None;
+			let report = ReportFinding { finding: f, reviewed_revision: None, phase_review: true };
+			let body = render_body(&repo(), &report);
+			let values = literal_values(&body);
+			let location = format!("{path}:4-6");
+			assert!(
+				values.iter().any(|v| v == &location || v == &format!("{location}\n")),
+				"path is literal: {path:?}"
+			);
+			assert!(values.contains(&report.finding.description));
+			assert!(values.contains(&"Out-of-bounds index in idx".into()));
+			assert!(values.contains(&"acme/widget".into()));
+		}
+	}
+
+	#[test]
+	fn phase_issue_title_uses_plain_compaction_not_markdown_encoding() {
+		let mut f = finding();
+		f.title = " [title](url)\n<img> `ticks` ".into();
+		assert_eq!(render_title(&f), "[title](url) <img> `ticks`");
 	}
 }

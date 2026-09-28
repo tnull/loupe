@@ -1005,11 +1005,7 @@ fn reporter_secret(state: &AppState, repo: &repos::RepoRow) -> anyhow::Result<St
 fn report_finding_from_row(
 	state: &AppState, row: findings::FindingRow,
 ) -> anyhow::Result<reporters::ReportFinding> {
-	let job_id = row.job_id;
-	let finding = row.into_finding();
-	let reviewed_revision =
-		state.db.with_conn(|c| Ok(jobs::get(c, job_id)?))?.and_then(|j| j.head_sha);
-	Ok(reporters::ReportFinding { finding, reviewed_revision })
+	Ok(state.db.with_conn(|conn| reporters::ReportFinding::from_row(conn, row))?)
 }
 
 fn mark_reported(state: &AppState, ids: &[i64], now: i64) -> anyhow::Result<usize> {

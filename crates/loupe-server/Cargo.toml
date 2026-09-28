@@ -45,6 +45,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+pulldown-cmark = { version = "0.13", default-features = false }
 git2 = { workspace = true }
 loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
 # Keep this test dependency path-only: Cargo omits it on publication,
