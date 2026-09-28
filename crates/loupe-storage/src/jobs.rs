@@ -26,6 +26,13 @@ pub const MAX_ATTEMPTS: u32 = 3;
 pub const JOB_CANCELLED_BY_ADMIN_ERROR: &str = "cancelled by admin";
 pub const LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR: &str = "lease expired after max attempts";
 
+// Numeric provenance only: a missing or unreadable canonical payload must not
+// downgrade phase verification to legacy recovery. Evaluated against `jobs`.
+const PHASE_FINDING_TARGET_SQL: &str = "(
+ EXISTS(SELECT 1 FROM finding_review_details d WHERE d.finding_id=jobs.target_finding_id)
+ OR EXISTS(SELECT 1 FROM finding_verification_intents i WHERE i.finding_id=jobs.target_finding_id)
+ OR EXISTS(SELECT 1 FROM findings f JOIN jobs p ON p.id=f.job_id WHERE f.id=jobs.target_finding_id AND p.campaign_id IS NOT NULL))";
+
 /// Widen only when the runtime can authorize and finish the added kinds.
 pub const RUNTIME_KINDS: &[JobKind] = &[JobKind::Scan, JobKind::Verify];
 
@@ -289,6 +296,12 @@ pub fn retry_failed(
 	conn: &mut Connection, job_id: i64, now: i64, validating_deadline: i64,
 ) -> rusqlite::Result<RetryOutcome> {
 	let tx = conn.transaction()?;
+	// The legacy operator escape hatch resets attempts and finding deadlines.
+	// Phase work instead needs typed recovery/re-admission; do not decode its
+	// unrelated recipe or evidence merely to refuse this legacy transition.
+	if tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND (campaign_id IS NOT NULL OR {PHASE_FINDING_TARGET_SQL}))"),[job_id],|r|r.get::<_,bool>(0))? {
+		return Ok(RetryOutcome::Conflict("phase work requires typed recovery; legacy retry cannot reset its frozen attempt budget".into()));
+	}
 	let Some(row) = get(&tx, job_id)? else { return Ok(RetryOutcome::NotFound) };
 	if !RUNTIME_KINDS.contains(&row.kind) {
 		return Ok(RetryOutcome::UnsupportedKind);
@@ -556,28 +569,33 @@ pub fn reap_stale_leases(conn: &mut Connection, now: i64) -> crate::Result<usize
 		.collect::<rusqlite::Result<Vec<_>>>()?;
 	let error = loupe_core::text::BoundedText::new(LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR)?;
 	let mut reaped = legacy;
+	let mut first_error = None;
 	for id in campaign_jobs {
 		// One transaction per job so a single undecidable row (for example a
 		// policy snapshot this binary cannot read) cannot stall the others.
 		let outcome = crate::transaction::immediate(conn, |tx| {
-			crate::scheduler::retry_or_fail(tx, id, now, &error)
+			// Candidate collection precedes this lock. A heartbeat, terminal
+			// report, or another reaper may have changed the row meanwhile.
+			if !tx.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND campaign_id IS NOT NULL AND state='leased' AND lease_expires_at<?2 AND kind IN('survey','drilldown','verify'))",params![id,now],|r|r.get::<_,bool>(0))? {
+				return Ok(false);
+			}
+			crate::scheduler::retry_or_fail(tx, id, now, &error)?;
+			Ok(true)
 		});
 		match outcome {
-			Ok(_) => reaped += 1,
+			Ok(changed) => reaped += usize::from(changed),
 			Err(cause) => {
-				let message = format!("reaper could not decide a retry: {cause}");
-				let failed = crate::transaction::immediate(conn, |tx| {
-					Ok(tx.execute(
-						"UPDATE jobs
-						   SET state = 'failed', error = ?2, finished_at = ?3, worker_id = NULL,
-						       lease_expires_at = NULL, job_capability_hash = NULL
-						 WHERE id = ?1 AND state = 'leased'",
-						params![id, message, now],
-					)?)
-				})?;
-				reaped += failed;
+				if first_error.is_none() {
+					first_error = Some(cause);
+				}
 			},
 		}
+	}
+	// Known policy/payload incompatibilities are terminalized by retry_or_fail.
+	// Unexpected database failures roll back only their own job and remain errors;
+	// unrelated leases, including legacy work, have still made durable progress.
+	if let Some(error) = first_error {
+		return Err(error);
 	}
 	Ok(reaped)
 }
@@ -587,6 +605,18 @@ fn reap_legacy(conn: &Transaction<'_>, now: i64) -> crate::Result<usize> {
 		JobState::Leased.apply(JobTransition::ReapToQueued).map_err(sql_state_transition_error)?;
 	let failed_state =
 		JobState::Leased.apply(JobTransition::ReapToFailed).map_err(sql_state_transition_error)?;
+	// Historical/misclassified jobs can lack campaign context even though their
+	// finding is canonical phase evidence. Fail only the execution; never revive
+	// it through legacy verification or mutate the retained finding/intent.
+	let incompatible = conn.execute(
+		&format!(
+			"UPDATE jobs SET state=?2,worker_id=NULL,lease_expires_at=NULL,
+		 job_capability_hash=NULL,finished_at=?1,error=COALESCE(error,?3)
+		 WHERE campaign_id IS NULL AND kind='verify' AND state='leased'
+		 AND lease_expires_at<?1 AND {PHASE_FINDING_TARGET_SQL}"
+		),
+		params![now, failed_state.as_str(), "legacy verification cannot target phase findings"],
+	)?;
 	let failing_scan_jobs = {
 		let mut stmt = conn.prepare(
 			"SELECT id FROM jobs
@@ -637,7 +667,7 @@ fn reap_legacy(conn: &Transaction<'_>, now: i64) -> crate::Result<usize> {
 	for job_id in failing_scan_jobs {
 		crate::findings::delete_pending_for_job(conn, job_id)?;
 	}
-	Ok(requeued + failed)
+	Ok(incompatible + requeued + failed)
 }
 
 fn sql_state_transition_error(error: StateTransitionError) -> rusqlite::Error {

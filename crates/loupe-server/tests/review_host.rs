@@ -27,6 +27,9 @@ mod context;
 #[path = "review_inventory/mod.rs"]
 mod inventory_dispositions;
 
+#[path = "review_lifecycle/mod.rs"]
+mod lifecycle;
+
 #[path = "review_units/mod.rs"]
 mod unit_proposals;
 

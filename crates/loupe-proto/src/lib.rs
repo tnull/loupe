@@ -15,6 +15,7 @@ pub mod review_drilldown;
 pub mod review_evidence;
 pub mod review_inventory;
 pub mod review_lease;
+pub mod review_lifecycle;
 pub mod review_terminal;
 pub mod review_units;
 mod scan;

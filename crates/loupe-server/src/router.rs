@@ -45,16 +45,16 @@ pub fn router(state: AppState) -> Router {
 		.route("/v1/jobs", get(routes::jobs::list))
 		.route("/v1/jobs/{id}", get(routes::jobs::get))
 		.route("/v1/jobs/{id}/retry", post(routes::jobs::retry))
-		.route("/v1/jobs/{id}/cancel", post(routes::jobs::cancel))
+		.route("/v1/jobs/{id}/cancel", post(routes::review_lifecycle::cancel))
 		.route_layer(axum::middleware::from_fn(auth::require_admin));
 
 	let worker_only = Router::new()
 		.route("/v1/jobs/lease", post(routes::jobs::lease))
-		.route("/v1/jobs/{id}/heartbeat", post(routes::jobs::heartbeat))
+		.route("/v1/jobs/{id}/heartbeat", post(routes::review_lifecycle::heartbeat))
 		.route("/v1/jobs/{id}/findings", post(routes::jobs::submit_findings))
 		.route("/v1/jobs/{id}/llm-findings", post(routes::jobs::submit_llm_finding))
 		.route("/v1/jobs/{id}/verdict", post(routes::jobs::submit_verdict))
-		.route("/v1/jobs/{id}/complete", post(routes::jobs::complete))
+		.route("/v1/jobs/{id}/complete", post(routes::review_lifecycle::complete))
 		.route("/v1/jobs/{id}/pin-target", post(routes::review_host::pin_target))
 		.route("/v1/jobs/{id}/inventory-batches", post(routes::review_host::inventory_batch))
 		.route("/v1/jobs/{id}/seal-inventory", post(routes::review_host::seal_inventory))
@@ -91,6 +91,13 @@ pub fn router(state: AppState) -> Router {
 		.with_state(state)
 		.layer(axum::middleware::from_fn(
 			|req: axum::extract::Request, next: axum::middleware::Next| async move {
+				let control =
+					req.extensions().get::<axum::extract::MatchedPath>().is_some_and(|path| {
+						matches!(
+							path.as_str(),
+							"/v1/jobs/{id}/complete" | "/v1/jobs/{id}/heartbeat"
+						)
+					});
 				let phase = req
 					.extensions()
 					.get::<axum::extract::MatchedPath>()
@@ -111,6 +118,9 @@ pub fn router(state: AppState) -> Router {
 					request_protocol_error(req.headers().get(PROTOCOL_VERSION_HEADER))
 				{
 					let mut resp = (StatusCode::BAD_REQUEST, msg).into_response();
+					if control {
+						resp = crate::review::http::bound_control_errors(resp).await;
+					}
 					resp.headers_mut().insert(
 						PROTOCOL_VERSION_HEADER,
 						PROTOCOL_VERSION.to_string().parse().expect("u16 parses as header value"),
@@ -118,6 +128,9 @@ pub fn router(state: AppState) -> Router {
 					return resp;
 				}
 				let mut resp = next.run(req).await;
+				if control {
+					resp = crate::review::http::bound_control_errors(resp).await;
+				}
 				resp.headers_mut().insert(
 					PROTOCOL_VERSION_HEADER,
 					PROTOCOL_VERSION.to_string().parse().expect("u16 parses as header value"),

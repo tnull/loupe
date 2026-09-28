@@ -6,12 +6,12 @@ use claim::claim_kinds;
 pub use claim::{claim, initialize_ordinary_batch, BatchInitialization, ClaimRequest, Claimed};
 use loupe_core::text::policy::{Payload, Reason};
 use loupe_core::text::{BoundedJson, BoundedText};
-use loupe_core::{JobKind, JobState, WORKFLOW_CONTRACT_VERSION};
+use loupe_core::{JobKind, WORKFLOW_CONTRACT_VERSION};
 pub use policy::{CampaignPolicy, PhasePolicy};
 use rusqlite::{params, Connection, Transaction};
 
-use crate::review::{changed, is_unique};
-use crate::{campaigns, jobs, ownership, Conflict, Entity, Error, Ownership, Result};
+use crate::review::is_unique;
+use crate::{campaigns, ownership, Conflict, Entity, Error, Ownership, Result};
 
 fn invalid(field: &'static str) -> Error {
 	loupe_core::text::Error::new(field, loupe_core::text::Rule::Identifier).into()
@@ -123,39 +123,13 @@ pub enum RetryOutcome {
 pub fn retry_or_fail(
 	tx: &Transaction<'_>, job_id: i64, now: i64, error: &BoundedText<Reason>,
 ) -> Result<RetryOutcome> {
-	let job = jobs::get(tx, job_id)?.ok_or(Error::NotFound(Entity::Job, job_id))?;
-	if job.state != JobState::Leased
-		|| !matches!(job.kind, JobKind::Survey | JobKind::Drilldown | JobKind::Verify)
-	{
-		return Err(Error::Conflict(Conflict::JobState));
-	}
-	let campaign_id = job.campaign_id.ok_or(Error::Conflict(Conflict::CampaignState))?;
-	let campaign =
-		campaigns::get(tx, campaign_id)?.ok_or(Error::NotFound(Entity::Campaign, campaign_id))?;
-	let inactive_reason;
-	let failure = if campaign.state != campaigns::State::Active {
-		inactive_reason = format!("campaign {}", campaign.state.as_str());
-		Some(inactive_reason.as_str())
-	} else {
-		let policy = CampaignPolicy::from_snapshot(&campaign.effective_policy)?;
-		if job.attempts >= policy.max_attempts {
-			Some(error.expose())
-		} else {
-			let eligible_at = now
-				.checked_add(policy.retry_delay(job.attempts))
-				.ok_or_else(|| invalid("eligible_at"))?;
-			changed(tx.execute("UPDATE jobs SET state='queued',worker_id=NULL,lease_expires_at=NULL,job_capability_hash=NULL,eligible_at=?2,hard_deadline_at=NULL,soft_deadline_at=NULL,submit_by=NULL WHERE id=?1 AND state='leased'", params![job_id,eligible_at])?, Conflict::JobState)?;
-			return Ok(RetryOutcome::Requeued { eligible_at });
-		}
-	};
-	changed(tx.execute("UPDATE jobs SET state='failed',error=?2,finished_at=?3,worker_id=NULL,lease_expires_at=NULL,job_capability_hash=NULL WHERE id=?1 AND state='leased'", params![job_id,failure,now])?, Conflict::JobState)?;
-	Ok(RetryOutcome::Failed)
+	crate::phase_lifecycle::retry_or_fail(tx, job_id, now, error)
 }
 
 pub fn cancel_queued_children(
 	tx: &Transaction<'_>, campaign_id: i64, now: i64, reason: &BoundedText<Reason>,
 ) -> Result<usize> {
-	Ok(tx.execute("UPDATE jobs SET state='cancelled',error=?2,finished_at=?3,job_capability_hash=NULL WHERE campaign_id=?1 AND state='queued'", params![campaign_id,reason.expose(),now])?)
+	crate::phase_lifecycle::cancel_queued(tx, campaign_id, now, reason)
 }
 #[cfg(test)]
 mod tests;

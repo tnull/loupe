@@ -208,6 +208,9 @@ pub async fn retry_verify(
 					"SELECT f.id, f.repo_id, f.job_id
 						   FROM findings f
 						  WHERE f.verification_required = 1
+						    AND NOT EXISTS (SELECT 1 FROM finding_review_details d WHERE d.finding_id=f.id)
+						    AND NOT EXISTS (SELECT 1 FROM finding_verification_intents i WHERE i.finding_id=f.id)
+						    AND NOT EXISTS (SELECT 1 FROM jobs p WHERE p.id=f.job_id AND p.campaign_id IS NOT NULL)
 						    AND (?1 IS NULL OR f.repo_id = ?1)
 						    AND (
 						      (

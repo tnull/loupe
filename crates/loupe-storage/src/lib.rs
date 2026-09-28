@@ -25,6 +25,7 @@ pub mod lead_observations;
 pub mod leads;
 pub mod migrations;
 pub mod ownership;
+pub mod phase_lifecycle;
 pub mod proofs;
 pub mod repos;
 mod review;

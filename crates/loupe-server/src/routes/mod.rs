@@ -7,6 +7,7 @@ pub mod review_drilldown;
 pub mod review_evidence;
 pub mod review_host;
 pub mod review_inventory;
+pub mod review_lifecycle;
 pub mod review_survey;
 pub mod review_units;
 pub mod whoami;

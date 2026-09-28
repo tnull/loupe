@@ -198,6 +198,9 @@ fn legacy_retry_conflicts_instead_of_tripping_the_active_verify_index() {
 	let mut conn = Connection::open_in_memory().unwrap();
 	settled(&mut conn);
 	apply_pending(&mut conn).unwrap();
+	// Exercise today's runtime only after completing all supported upgrades.
+	// The legacy duplicate pair admitted by v3 must still produce this conflict.
+	super::apply_pending(&mut conn).unwrap();
 	let outcome = jobs::retry_failed(&mut conn, 6, 100, 700)
 		.expect("retry on migrated legacy data must not fail with a raw constraint error");
 	match outcome {

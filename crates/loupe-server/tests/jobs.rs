@@ -273,7 +273,7 @@ async fn campaign_capability_cannot_submit_legacy_verdict() {
 }
 
 #[tokio::test]
-async fn campaign_capability_cannot_use_legacy_lifecycle() {
+async fn campaign_control_requires_phase_protocol_header() {
 	let mut statuses = Vec::new();
 	for operation in ["heartbeat", "complete"] {
 		let (f, env, _) = campaign_verify_fixture().await;
@@ -291,12 +291,25 @@ async fn campaign_capability_cannot_use_legacy_lifecycle() {
 			.await
 			.unwrap();
 		statuses.push(response.status().as_u16());
+		assert_eq!(response.headers()["cache-control"], "no-store");
+		let error: serde_json::Value = response.json().await.unwrap();
+		assert_eq!(error["error"]["code"], "invalid_request");
+		assert_eq!(error["error"]["detail"], "one exact X-Loupe-Protocol header is required");
+		f.db.with_conn(|conn| {
+			assert_eq!(
+				conn.query_row("SELECT state FROM jobs WHERE id=?1", [env.job_id], |r| r
+					.get::<_, String>(0))?,
+				"leased"
+			);
+			Ok(())
+		})
+		.unwrap();
 		f.handle.shutdown().await;
 	}
 	assert_eq!(
 		statuses,
-		vec![403, 403],
-		"phase lifecycle stays closed until its deadline-aware handler exists"
+		vec![400, 400],
+		"phase control requires its protocol header even though legacy control permits omission"
 	);
 }
 

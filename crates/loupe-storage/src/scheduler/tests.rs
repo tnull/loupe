@@ -248,7 +248,7 @@ fn retries_use_snapshot_limits_and_preserve_assignments() {
 	db.with_conn(|conn| transaction::immediate(conn, |tx| {
 		let policy = CampaignPolicy { max_attempts: 5, ..CampaignPolicy::default() };
 		let snapshot = BoundedJson::<Payload>::new(&serde_json::to_string(&policy).unwrap())?;
-		tx.execute("UPDATE review_campaigns SET effective_policy=?1 WHERE campaign_id=1", [snapshot.expose()])?;
+		tx.execute("UPDATE review_campaigns SET effective_policy=?1,effective_policy_digest=?2 WHERE campaign_id=1", rusqlite::params![snapshot.expose(),snapshot.digest().as_slice()])?;
 		tx.execute_batch("UPDATE jobs SET state='leased',attempts=4,hard_deadline_at=500,submit_by=400,soft_deadline_at=400,job_capability_hash=zeroblob(32) WHERE id=101;
 		INSERT INTO review_units (review_unit_id,generation_id,client_review_unit_key,title,objective,source_refs,created_at) VALUES (1,11,'u','t','o','[]',0);
 		INSERT INTO job_assigned_review_units (job_id,review_unit_id,position,completed) VALUES (101,1,0,0);")?;
@@ -288,7 +288,7 @@ fn reaper_uses_campaign_attempts_without_changing_legacy_limits() {
 	db.with_conn(|conn| {
 		let policy = CampaignPolicy { max_attempts: 5, ..CampaignPolicy::default() };
 		let snapshot = BoundedJson::<Payload>::new(&serde_json::to_string(&policy).unwrap())?;
-		conn.execute("UPDATE review_campaigns SET effective_policy=?1 WHERE campaign_id=1", [snapshot.expose()])?;
+		conn.execute("UPDATE review_campaigns SET effective_policy=?1,effective_policy_digest=?2 WHERE campaign_id=1", rusqlite::params![snapshot.expose(),snapshot.digest().as_slice()])?;
 		conn.execute_batch("UPDATE jobs SET kind='verify',state='leased',lease_expires_at=100,attempts=3 WHERE id=101;
 		INSERT INTO jobs (repo_id,kind,state,lease_expires_at,attempts,enqueued_at) VALUES (1,'scan','leased',100,3,0);")?;
 		let legacy = conn.last_insert_rowid();
@@ -299,6 +299,8 @@ fn reaper_uses_campaign_attempts_without_changing_legacy_limits() {
 		Ok(())
 	}).unwrap();
 }
+#[path = "../phase_lifecycle_tests.rs"]
+mod lifecycle;
 
 #[test]
 fn inactive_drilldown_reaping_releases_assignment_for_next_campaign() {

@@ -156,6 +156,41 @@ pub async fn bound_phase_errors(response: Response) -> Response {
 	ApiError::new(parts.status, code).into_response()
 }
 
+/// Shared lifecycle routes retain legacy status/body/header acceptance and
+/// successful responses. Protocol-3 error bodies are bounded and non-cacheable
+/// for every identity; plain legacy diagnostics survive only as bounded detail.
+pub async fn bound_control_errors(response: Response) -> Response {
+	if !response.status().is_client_error() && !response.status().is_server_error() {
+		return response;
+	}
+	if response
+		.headers()
+		.get(header::CONTENT_TYPE)
+		.is_some_and(|v| v.as_bytes() == b"application/json")
+	{
+		return bound_phase_errors(response).await;
+	}
+	let status = response.status();
+	let bytes = to_bytes(response.into_body(), 4096).await.ok();
+	let detail = bytes
+		.and_then(|b| String::from_utf8(b.to_vec()).ok())
+		.filter(|s| !s.is_empty())
+		.map(|s| s.chars().take(256).collect());
+	ApiError {
+		status,
+		code: match status {
+			StatusCode::FORBIDDEN => "denied",
+			StatusCode::UNAUTHORIZED => "unauthenticated",
+			StatusCode::BAD_REQUEST => "invalid_request",
+			StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
+			_ => "request_failed",
+		},
+		detail,
+		current_revision: None,
+	}
+	.into_response()
+}
+
 pub async fn json<T: DeserializeOwned>(
 	headers: &HeaderMap, body: Body, max_bytes: usize,
 ) -> Result<T> {
