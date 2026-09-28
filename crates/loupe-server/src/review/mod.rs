@@ -1,4 +1,5 @@
 //! Server-owned orchestration for the stateful review workflow.
+pub mod admission_validation;
 pub mod authority;
 pub mod campaign;
 pub mod envelope;

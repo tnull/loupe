@@ -265,11 +265,8 @@ pub fn transaction<T: Serialize>(
 		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 		let outcome = (|| {
 			let value = body(&tx, now)?;
-			let mut output = BoundedBody { bytes: Vec::new(), limit: response_limit };
-			serde_json::to_writer(&mut output, &value).map_err(|_| {
-				ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "response_too_large")
-			})?;
-			Ok(output.bytes)
+			serialize_bounded(&value, response_limit)
+				.map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "response_too_large"))
 		})();
 		match outcome {
 			Ok(bytes) => {
@@ -287,6 +284,15 @@ pub fn transaction<T: Serialize>(
 		}
 	})
 	.map_err(ApiError::from)?
+}
+
+/// Shared precommit serializer; the only writer error is the byte ceiling.
+pub(crate) fn serialize_bounded<T: Serialize>(
+	value: &T, limit: usize,
+) -> std::result::Result<Vec<u8>, serde_json::Error> {
+	let mut output = BoundedBody { bytes: Vec::new(), limit };
+	serde_json::to_writer(&mut output, value)?;
+	Ok(output.bytes)
 }
 
 #[cfg(test)]

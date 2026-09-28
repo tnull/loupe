@@ -397,7 +397,42 @@ pub fn admit_exact_batch(
 	{
 		return Err(Error::Conflict(Conflict::Assignment));
 	}
-	let holds = batch_holds(tx, batch_id)?;
+	let (holds, epochs) = pending_members(tx, &batch, &p)?;
+	changed(tx.execute("UPDATE survey_continuation_batches SET state='admitted',admitted_job_id=?2 WHERE batch_id=?1 AND state='pending' AND admitted_job_id IS NULL",params![batch_id,child_job])?,Conflict::Assignment)?;
+	for (h, epoch) in holds.iter().zip(epochs) {
+		changed(tx.execute("UPDATE review_units SET status='open',defer_reason=NULL,assignment_epoch=assignment_epoch+1 WHERE review_unit_id=?1 AND assignment_epoch=?2",params![h.unit_id,epoch])?,Conflict::Assignment)?;
+		tx.execute("INSERT INTO job_assigned_review_units(job_id,review_unit_id,position,assignment_epoch) SELECT ?1,review_unit_id,?3,assignment_epoch FROM review_units WHERE review_unit_id=?2",params![child_job,h.unit_id,h.batch_position])?;
+	}
+	assigned_units(tx, child_job)
+}
+
+/// Read-only integrity check for maintenance, irrespective of due time or
+/// worker advertisements. This never admits, leases, charges or takes epochs.
+pub fn validate_pending_batch(tx: &Transaction<'_>, batch_id: i64) -> Result<()> {
+	let batch = get_batch(tx, batch_id)?.ok_or(Error::Conflict(Conflict::Assignment))?;
+	let p = review_intents::producer(tx, batch.producer_job_id)?;
+	if batch.state != State::Pending
+		|| batch.admitted_job_id.is_some()
+		|| batch.continuation_class != ContinuationClass::SourceAnalysisRemaining
+		|| batch.block_reason.is_some()
+		|| batch.not_before.is_none()
+		|| !(1..=32).contains(&batch.expected_unit_count)
+		|| batch.priority.score > 550
+		|| p.job.kind != JobKind::Survey
+		|| p.generation != batch.generation_id
+		|| p.campaign != batch.campaign_id
+		|| p.job.repo_id != batch.repo_id
+	{
+		return Err(Error::Conflict(Conflict::Assignment));
+	}
+	pending_members(tx, &batch, &p)?;
+	Ok(())
+}
+
+fn pending_members(
+	tx: &Transaction<'_>, batch: &Batch, p: &review_intents::JobContext,
+) -> Result<(Vec<Hold>, Vec<i64>)> {
+	let holds = batch_holds(tx, batch.batch_id)?;
 	if holds.len() != batch.expected_unit_count as usize {
 		return Err(Error::Conflict(Conflict::Assignment));
 	}
@@ -416,15 +451,10 @@ pub fn admit_exact_batch(
 			return Err(Error::Conflict(Conflict::Assignment));
 		}
 		let epoch = handoff_epoch(tx, h, &producer, incoming.as_ref())?;
-		validate_held_source(tx, h, &p, epoch)?;
+		validate_held_source(tx, h, p, epoch)?;
 		epochs.push(epoch);
 	}
-	changed(tx.execute("UPDATE survey_continuation_batches SET state='admitted',admitted_job_id=?2 WHERE batch_id=?1 AND state='pending' AND admitted_job_id IS NULL",params![batch_id,child_job])?,Conflict::Assignment)?;
-	for (h, epoch) in holds.iter().zip(epochs) {
-		changed(tx.execute("UPDATE review_units SET status='open',defer_reason=NULL,assignment_epoch=assignment_epoch+1 WHERE review_unit_id=?1 AND assignment_epoch=?2",params![h.unit_id,epoch])?,Conflict::Assignment)?;
-		tx.execute("INSERT INTO job_assigned_review_units(job_id,review_unit_id,position,assignment_epoch) SELECT ?1,review_unit_id,?3,assignment_epoch FROM review_units WHERE review_unit_id=?2",params![child_job,h.unit_id,h.batch_position])?;
-	}
-	assigned_units(tx, child_job)
+	Ok((holds, epochs))
 }
 
 pub(crate) fn block_job_work(

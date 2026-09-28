@@ -253,6 +253,32 @@ fn insert_initial(
 	Ok(())
 }
 
+/// Read-only permanent eligibility shared by admission and maintenance. This
+/// does not filter by due time, worker capability, active jobs or capacity, and
+/// does not authorize admission by itself. Admitted execution retries retain
+/// their separate (open-only lead) checks.
+pub fn pending_subject_eligible(conn: &Connection, intent: &Intent) -> Result<bool> {
+	let continuation = match intent.kind {
+		IntentKind::InitialHandoff
+			if intent.logical_sequence == 0 && intent.continuation_class.is_none() =>
+		{
+			false
+		},
+		IntentKind::LogicalContinuation
+			if intent.logical_sequence > 0
+				&& intent.continuation_class
+					== Some(ContinuationClass::SourceAnalysisRemaining) =>
+		{
+			true
+		},
+		_ => return Ok(false),
+	};
+	Ok(match intent.subject {
+		Subject::Lead(id)=>conn.query_row("SELECT EXISTS(SELECT 1 FROM leads WHERE lead_id=?1 AND generation_id=?2 AND (status='open' OR (status='deferred' AND ?3=1)))",params![id,intent.generation_id,continuation],|r|r.get(0))?,
+		Subject::Finding(id)=>conn.query_row("SELECT EXISTS(SELECT 1 FROM findings WHERE id=?1 AND repo_id=?2 AND state='validating')",params![id,intent.repo_id],|r|r.get(0))?,
+	})
+}
+
 /// Called after the child received its first live lease, in the same transaction.
 pub fn admit_subject(
 	tx: &Transaction<'_>, subject: Subject, revision: i64, child: i64, now: i64,
@@ -288,11 +314,7 @@ pub fn admit_subject(
 		} {
 		return Err(Error::Conflict(Conflict::Assignment));
 	}
-	let eligible:bool=match subject {
-		Subject::Lead(id)=>tx.query_row("SELECT EXISTS(SELECT 1 FROM leads WHERE lead_id=?1 AND (status='open' OR (status='deferred' AND ?2=1)))",params![id,intent.kind==IntentKind::LogicalContinuation],|r|r.get(0))?,
-		Subject::Finding(id)=>tx.query_row("SELECT EXISTS(SELECT 1 FROM findings WHERE id=?1 AND state='validating')",[id],|r|r.get(0))?,
-	};
-	if !eligible {
+	if !pending_subject_eligible(tx, &intent)? {
 		return Err(Error::Conflict(Conflict::Assignment));
 	}
 	changed(tx.execute(&format!("UPDATE {} SET state='admitted',admitted_job_id=?3,updated_at=?4 WHERE {}=?1 AND intent_revision=?2 AND state='pending' AND block_reason IS NULL AND (not_before IS NULL OR not_before<=?4)",subject.table(),subject.key()),params![subject.id(),revision,child,now])?,Conflict::Assignment)?;

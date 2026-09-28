@@ -97,7 +97,7 @@ pub fn router(state: AppState) -> Router {
 					req.extensions().get::<axum::extract::MatchedPath>().is_some_and(|path| {
 						matches!(
 							path.as_str(),
-							"/v1/jobs/{id}/complete" | "/v1/jobs/{id}/heartbeat"
+							"/v1/jobs/{id}/complete" | "/v1/jobs/{id}/heartbeat" | "/v1/jobs/lease"
 						)
 					});
 				let phase = req

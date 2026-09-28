@@ -33,6 +33,16 @@ const PHASE_FINDING_TARGET_SQL: &str = "(
  OR EXISTS(SELECT 1 FROM finding_verification_intents i WHERE i.finding_id=jobs.target_finding_id)
  OR EXISTS(SELECT 1 FROM findings f JOIN jobs p ON p.id=f.job_id WHERE f.id=jobs.target_finding_id AND p.campaign_id IS NOT NULL))";
 
+/// Numeric provenance shared by admission and legacy recovery. Missing or
+/// unreadable canonical evidence can never downgrade a phase target to legacy.
+pub fn targets_phase_finding(conn: &Connection, job: i64) -> rusqlite::Result<bool> {
+	conn.query_row(
+		&format!("SELECT {PHASE_FINDING_TARGET_SQL} FROM jobs WHERE id=?1"),
+		[job],
+		|r| r.get(0),
+	)
+}
+
 /// Widen only when the runtime can authorize and finish the added kinds.
 pub const RUNTIME_KINDS: &[JobKind] = &[JobKind::Scan, JobKind::Verify];
 

@@ -25,7 +25,7 @@ pub enum Access {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum SurveyRecipe {
+pub(super) enum SurveyRecipe {
 	Bootstrap,
 	Coverage,
 	Incremental,
@@ -35,13 +35,13 @@ enum SurveyRecipe {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum AssignmentKey {
+pub(super) enum AssignmentKey {
 	Ordinary,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
-enum Recipe {
+pub(super) enum Recipe {
 	Survey {
 		#[serde(rename = "version")]
 		_version: Version1,
@@ -60,17 +60,17 @@ enum Recipe {
 }
 
 impl Recipe {
-	fn phase(&self) -> JobKind {
+	pub(super) fn phase(&self) -> JobKind {
 		match self {
 			Self::Survey { .. } => JobKind::Survey,
 			Self::Drilldown { .. } => JobKind::Drilldown,
 			Self::Verify { .. } => JobKind::Verify,
 		}
 	}
-	fn bootstrap(&self) -> bool {
+	pub(super) fn bootstrap(&self) -> bool {
 		matches!(self, Self::Survey { recipe: SurveyRecipe::Bootstrap, .. })
 	}
-	fn supported(&self, context: &stored::Context, access: Access) -> bool {
+	pub(super) fn supported(&self, context: &stored::Context, access: Access) -> bool {
 		if !matches!(context.campaign_recipe.as_str(), "bootstrap" | "incremental") {
 			return false;
 		}

@@ -12,9 +12,10 @@
 //! new work. Unpinned/bootstrap attempts require the consumer's explicit recipe
 //! exception; the storage leaf does not maintain a second recipe parser.
 
-use loupe_core::text::BoundedJson;
+use loupe_core::text::{BoundedJson, Identifier};
 use loupe_core::{JobKind, JobState, WORKFLOW_CONTRACT_VERSION};
 use rusqlite::{params, OptionalExtension, Transaction};
+use sha2::{Digest, Sha256};
 
 use crate::admission::{self, CapacityRefusal, Charged, Selection, WorkClass};
 use crate::admission_candidates::{self, Candidate, CandidateKind, Request};
@@ -35,6 +36,29 @@ pub enum Outcome {
 
 fn conflict() -> Error {
 	Error::Conflict(Conflict::JobState)
+}
+
+/// Read retained survey initialization without creating a marker or assigning
+/// any work. The consumer chooses the ordinary retry recipe cases that require
+/// this check, then separately validates every retained assignment and epoch.
+/// Keep the original initializer's SHA-256 marker, not the newer evidence hash.
+pub fn has_survey_retry_history(tx: &Transaction<'_>, job: i64) -> Result<bool> {
+	let assigned: bool = tx.query_row(
+		"SELECT EXISTS(SELECT 1 FROM job_assigned_review_units WHERE job_id=?1)",
+		[job],
+		|row| row.get(0),
+	)?;
+	if assigned {
+		return Ok(true);
+	}
+	let marker = crate::checkpoints::lookup(
+		tx,
+		job,
+		crate::checkpoints::Operation::InitializeSurveyBatch,
+		&Identifier::new("ordinary")?,
+		&Sha256::digest(b"{}").into(),
+	)?;
+	Ok(marker.is_some_and(|body| body.expose() == "{}"))
 }
 
 /// Rechecks the single global selector, then joins creation, first lease,
@@ -252,7 +276,10 @@ fn work_class(kind: &JobKind, band: Band) -> Result<WorkClass> {
 	}
 }
 
-fn validate_parent(
+/// Read-only provenance check shared with independent admission maintenance.
+/// The caller must separately validate current campaign readiness, canonical
+/// subject evidence and intent state; this alone never authorizes delivery.
+pub fn validate_parent(
 	tx: &Transaction<'_>, intent: &review_intents::Intent, kind: &JobKind,
 ) -> Result<()> {
 	let parent = get_job(tx, intent.originating_job_id)?;
@@ -282,7 +309,9 @@ fn validate_parent(
 	Ok(())
 }
 
-fn validate_retry_subject(tx: &Transaction<'_>, job: &jobs::JobRow) -> Result<()> {
+/// Read-only retained subject/parent/profile binding for a queued phase retry.
+/// This does not validate recipe support or grant fresh admission authority.
+pub fn validate_retry_subject(tx: &Transaction<'_>, job: &jobs::JobRow) -> Result<()> {
 	let subject = match job.kind {
 		JobKind::Drilldown if job.target_finding_id.is_none() => {
 			Subject::Lead(job.assigned_lead_id.ok_or_else(conflict)?)

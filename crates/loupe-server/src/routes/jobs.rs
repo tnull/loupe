@@ -17,16 +17,17 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use loupe_core::{FindingState, JobKind, JobState};
 use loupe_proto::{
 	validate_llm_finding_submission, CompleteOutcome, CompleteRequest, FindingsBatch,
-	HeartbeatRequest, HeartbeatResponse, JobCapability, JobInfo, LeaseEnvelope, LeasePayload,
-	LeaseRequest, LeaseResponse, LlmFindingSubmission, ScanRequest, ScanResponse,
-	VerdictSubmission, LLM_CODE_REVIEW_SCANNER_ID, PROTOCOL_VERSION,
+	HeartbeatRequest, HeartbeatResponse, JobInfo, LeaseRequest, LeaseResponse,
+	LlmFindingSubmission, ScanRequest, ScanResponse, VerdictSubmission, LLM_CODE_REVIEW_SCANNER_ID,
+	PROTOCOL_VERSION,
 };
 use loupe_storage::jobs::{self, JobRow, NewJob, DEFAULT_LEASE_SECONDS};
 use loupe_storage::{findings, repos, secrets};
@@ -274,20 +275,25 @@ pub(crate) const DEFAULT_VALIDATING_BUDGET_SECS: i64 = 7 * 24 * 60 * 60;
 /// historical poll-and-return-empty behaviour.
 pub async fn lease(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
-	Json(req): Json<LeaseRequest>,
-) -> Result<Json<LeaseResponse>, (StatusCode, String)> {
-	check_version(req.protocol_version)?;
-	// A worker is eligible for verify jobs iff it advertised at least
-	// one `verify:*` capability. Fine-grained tag matching (e.g.
-	// `verify:secrets` only matches secret-flavoured verify jobs) is a
-	// follow-up; today we only have one tag in flight.
-	let accepts_verify = req.capabilities.iter().any(|c| c.starts_with("verify:"));
-
-	if let Some(env) = try_lease(&state, worker.id(), accepts_verify)? {
-		return Ok(Json(LeaseResponse::Lease(Box::new(env))));
+	mut headers: HeaderMap, body: Body,
+) -> crate::review::http::Result<Response> {
+	// Historical clients supplied the version only in JSON. Keep that contract,
+	// while a supplied header must still satisfy the shared exact-version check.
+	if !headers.contains_key(loupe_proto::PROTOCOL_VERSION_HEADER) {
+		headers.insert(
+			loupe_proto::PROTOCOL_VERSION_HEADER,
+			PROTOCOL_VERSION.to_string().parse().expect("protocol version header"),
+		);
 	}
-	if req.wait_seconds == 0 {
-		return Ok(Json(LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION }));
+	let req: LeaseRequest = crate::review::http::json(&headers, body, 8 * 1024).await?;
+	check_version(req.protocol_version)
+		.map_err(|(_, message)| crate::review::http::ApiError::invalid(message))?;
+	let mut repairs_left = crate::review::scheduler::MAX_REPAIRS;
+	if let Some(bytes) = try_lease(&state, worker.id(), &req, &mut repairs_left)? {
+		return Ok(lease_response(Some(bytes)));
+	}
+	if req.wait_seconds == 0 || repairs_left == 0 {
+		return Ok(lease_response(None));
 	}
 
 	let wait = std::time::Duration::from_secs(req.wait_seconds.min(MAX_LEASE_WAIT_SECS) as u64);
@@ -298,109 +304,43 @@ pub async fn lease(
 		let notified = state.job_arrived.notified();
 		tokio::pin!(notified);
 
-		if let Some(env) = try_lease(&state, worker.id(), accepts_verify)? {
-			return Ok(Json(LeaseResponse::Lease(Box::new(env))));
+		if let Some(bytes) = try_lease(&state, worker.id(), &req, &mut repairs_left)? {
+			return Ok(lease_response(Some(bytes)));
 		}
 
 		let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-		if remaining.is_zero() {
-			return Ok(Json(LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION }));
+		if remaining.is_zero() || repairs_left == 0 {
+			return Ok(lease_response(None));
 		}
 		tokio::select! {
 			_ = &mut notified => {
 				// New job — loop and try the lease again.
 			}
 			_ = tokio::time::sleep(remaining) => {
-				return Ok(Json(LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION }));
+				return Ok(lease_response(None));
 			}
 		}
 	}
 }
 
-/// One non-blocking lease attempt. `None` means no eligible job is
-/// queued. `accepts_verify` gates verify-kind jobs.
+/// A successful response is already serialized inside its claim transaction.
 fn try_lease(
-	state: &AppState, worker_id: i64, accepts_verify: bool,
-) -> Result<Option<LeaseEnvelope>, (StatusCode, String)> {
-	let now = now_secs();
-	let (job_capability, job_capability_hash) = job_capability::issue();
-	let kinds =
-		if accepts_verify { vec![JobKind::Scan, JobKind::Verify] } else { vec![JobKind::Scan] };
-	let row = crate::review::scheduler::claim_for_worker(
-		state,
-		worker_id,
-		&kinds,
-		now,
-		&job_capability_hash,
+	state: &AppState, worker_id: i64, request: &LeaseRequest, repairs_left: &mut u32,
+) -> crate::review::http::Result<Option<Vec<u8>>> {
+	crate::review::scheduler::claim_for_worker(state, worker_id, request, repairs_left).map_err(
+		|error| {
+			tracing::error!(%error,"claim transaction failed");
+			crate::review::http::ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "claim_failed")
+		},
 	)
-	.map(|claimed| claimed.map(|c| c.job))
-	.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lease: {e}")))?;
-	let Some(row) = row else { return Ok(None) };
-	let env = build_lease_envelope(state, &row, job_capability)
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")))?;
-	Ok(Some(env))
 }
 
-fn build_lease_envelope(
-	state: &AppState, row: &JobRow, job_capability: JobCapability,
-) -> anyhow::Result<LeaseEnvelope> {
-	let repo = state
-		.db
-		.with_conn(|c| Ok(repos::get(c, row.repo_id)?))?
-		.ok_or_else(|| anyhow::anyhow!("repo {} for leased job not found", row.repo_id))?;
-	// No clone-side credential is stored separately. We deliberately do
-	// not ship the reporting PAT to the worker.
-	let github_pat: Option<String> = None;
-
-	let payload = match row.kind {
-		JobKind::Scan => LeasePayload::Scan { since_sha: row.since_sha.clone() },
-		JobKind::Verify => {
-			let target_id = row
-				.target_finding_id
-				.ok_or_else(|| anyhow::anyhow!("verify job missing target_finding_id"))?;
-			let finding_row = state
-				.db
-				.with_conn(|c| Ok(findings::get(c, target_id)?))?
-				.ok_or_else(|| anyhow::anyhow!("verify target finding not found"))?;
-			if finding_row.repo_id != row.repo_id {
-				anyhow::bail!(
-					"verify target finding {} belongs to repo {}, not job repo {}",
-					target_id,
-					finding_row.repo_id,
-					row.repo_id
-				);
-			}
-			let reviewed_job_id = row.parent_job_id.unwrap_or(finding_row.job_id);
-			let reviewed_sha = state
-				.db
-				.with_conn(|c| Ok(jobs::get(c, reviewed_job_id)?))?
-				.and_then(|j| if j.kind == JobKind::Scan { j.head_sha } else { None });
-			let finding = finding_row.into_finding();
-			LeasePayload::Verify { finding_id: target_id, finding: Box::new(finding), reviewed_sha }
-		},
-		JobKind::Survey | JobKind::Drilldown | JobKind::Unknown(_) => {
-			anyhow::bail!("unsupported job kind in legacy lease envelope");
-		},
-	};
-
-	Ok(LeaseEnvelope {
-		protocol_version: PROTOCOL_VERSION,
-		job_id: row.id,
-		job_capability,
-		repo_id: repo.id,
-		repo: loupe_core::RepoSpec {
-			host: repo.host.clone(),
-			owner: repo.owner.clone(),
-			repo: repo.repo.clone(),
-			clone_url: repo.clone_url.clone(),
-			branch: repo.default_branch.clone(),
-		},
-		head_branch: repo.default_branch,
-		lease_expires_at: row.lease_expires_at.unwrap_or(0),
-		scanner_config: repo.scanner_config,
-		github_pat,
-		payload,
-	})
+fn lease_response(bytes: Option<Vec<u8>>) -> Response {
+	let bytes = bytes.unwrap_or_else(|| {
+		serde_json::to_vec(&LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION })
+			.expect("constant empty response")
+	});
+	([("content-type", "application/json"), ("cache-control", "no-store")], bytes).into_response()
 }
 
 /// `POST /v1/jobs/:id/heartbeat` — worker extends its lease.
