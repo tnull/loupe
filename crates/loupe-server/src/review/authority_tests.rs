@@ -359,8 +359,25 @@ fn exact_unit_membership_epoch_and_freshness_are_required() {
 		"UPDATE review_units SET assignment_epoch=4 WHERE review_unit_id=31",
 		"UPDATE review_units SET stale=1 WHERE review_unit_id=31",
 		"UPDATE review_units SET status='retired' WHERE review_unit_id=31",
-		"INSERT INTO review_unit_results(review_unit_id,commit_sha,profile_version,disposition,inspected_refs,result_payload,result_digest,created_at) SELECT 31,generation_commit_sha,1,'no_lead_found','[]','{}',zeroblob(32),0 FROM review_generations WHERE generation_id=11",
-	] { let f=fixture(); units(&f); mutate(&f, sql); assert!(!unit_allowed(&f,31,3), "{sql}"); }
+	] {
+		let f = fixture();
+		units(&f);
+		mutate(&f, sql);
+		assert!(!unit_allowed(&f, 31, 3), "{sql}");
+	}
+	// The conclusive negative control must be Recorded current evidence, not a
+	// historical payload that modern coverage deliberately leaves incomplete.
+	let f = fixture();
+	units(&f);
+	assert!(unit_allowed(&f, 31, 3));
+	f.db.with_conn(|conn|transaction::immediate(conn,|tx| {
+		tx.execute("UPDATE generation_manifests SET expected_entry_count=1,received_entry_count=1 WHERE generation_id=11",[])?;
+		tx.execute("INSERT INTO generation_inventory(generation_id,path,source_path,raw_path,blob_sha,entry_kind,git_mode,manifest_position,disposition,created_at) VALUES(11,'src.rs','src.rs',?1,?2,'tracked',33188,0,'context',0)",params![b"src.rs".as_slice(),SHA])?;
+		let payload=loupe_core::review_payload::UnitResultPayloadV1::from_json(&serde_json::json!({"format":"loupe.unit_result","version":1,"review_unit_id":31,"assignment_epoch":3,"disposition":"no_lead_found","inspected_refs":[{"path":"src.rs"}],"created_lead_ids":[],"counterevidence":"Guard traced","proof_gaps":"None"}).to_string())?;
+		loupe_storage::review_unit_results::insert_evidence(tx,&loupe_storage::review_unit_results::NewResultEvidence{generation_id:11,produced_by_job:101,commit_sha:SHA,profile_version:1,payload:&payload},NOW)?;
+		Ok(())
+	})).unwrap();
+	assert!(!unit_allowed(&f, 31, 3), "current conclusive evidence excludes another fresh result");
 	let f = fixture();
 	units(&f);
 	survey_recipe(&f, "bootstrap");

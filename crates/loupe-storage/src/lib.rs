@@ -32,6 +32,7 @@ pub mod repos;
 mod review;
 pub mod review_authority;
 pub mod review_compatibility;
+pub mod review_coverage;
 pub mod review_findings;
 pub mod review_intents;
 pub mod review_unit_results;
@@ -55,6 +56,8 @@ mod evidence_tests;
 mod proof_tests;
 #[cfg(test)]
 mod replay_tests;
+#[cfg(test)]
+mod review_coverage_tests;
 #[cfg(test)]
 mod review_tests;
 #[cfg(test)]

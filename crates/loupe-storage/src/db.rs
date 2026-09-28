@@ -79,6 +79,7 @@ impl Db {
 		conn.pragma_update(None, "foreign_keys", "ON")?;
 		conn.pragma_update(None, "synchronous", "NORMAL")?;
 		migrate(&mut conn)?;
+		crate::review_coverage::register(&conn)?;
 		// Foreign keys do not retroactively validate rows inserted with
 		// enforcement disabled. Check on every boot, not just during v3.
 		// NOT EXISTS rather than NOT IN: a NULL in the lookup would make

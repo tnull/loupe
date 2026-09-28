@@ -206,6 +206,10 @@ fn receiving_generation_cannot_activate_with_old_profile_and_digest() {
 fn receiving_generation_cannot_claim_complete_coverage() {
 	let db = fixture();
 	db.with_conn(|conn| {
+		// Isolate the receiving -> sealed transition: the other modern
+		// prerequisites must already be valid, even for an empty inventory.
+		let profile=loupe_core::review_payload::GeneratedProfile::new("{}")?;
+		conn.execute("UPDATE review_generations SET generation_commit_sha=?1,profile_version=1,generated_profile=?2,generated_profile_digest=?3 WHERE generation_id=11",params!["a".repeat(40),profile.expose(),profile.digest().as_slice()])?;
 		g::standalone::set_corroboration(conn, 11, g::Corroboration::Satisfied)?;
 		conn.execute(
 			"UPDATE review_generations SET inventory_digest=zeroblob(32) WHERE generation_id=11",

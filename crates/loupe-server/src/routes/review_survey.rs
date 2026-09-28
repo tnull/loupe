@@ -124,60 +124,22 @@ fn validate_producer(
 	Ok(())
 }
 
-/// Stream rather than collecting repository-size evidence. Relational legacy
-/// projections alone never certify modern coverage; historical evidence stays
-/// retained and simply leaves work incomplete.
+/// Use the same current-result truth as admission and fresh result authority.
+/// Producer validation above remains strict; unrelated damaged derived results
+/// merely leave repository coverage incomplete without being mutated here.
 fn coverage(tx: &Transaction<'_>, generation: &generations::Generation) -> Result<SurveySummary> {
-	let legacy = generations::coverage_rollup(tx, generation.generation_id)?;
+	let rollup = generations::coverage_rollup(tx, generation.generation_id)?;
 	let mut summary = SurveySummary {
 		version: Version1,
 		coverage: SurveyCoverage::Partial,
 		corroboration_satisfied: generation.corroboration == generations::Corroboration::Satisfied,
-		missing_results: 0,
-		needs_follow_up: 0,
-		unresolved_inventory: legacy.unresolved_inventory.try_into().map_err(|_| incompatible())?,
+		missing_results: rollup.missing_results.try_into().map_err(|_| incompatible())?,
+		needs_follow_up: rollup.needs_follow_up.try_into().map_err(|_| incompatible())?,
+		unresolved_inventory: rollup.unresolved_inventory.try_into().map_err(|_| incompatible())?,
 		follow_up_batches: 0,
 		follow_up_units: 0,
 	};
-	let mut statement=tx.prepare("SELECT u.review_unit_id,EXISTS(SELECT 1 FROM review_unit_holds h WHERE h.review_unit_id=u.review_unit_id)
-		FROM review_units u WHERE u.generation_id=?1 AND (u.status IN('open','deferred') OR EXISTS(SELECT 1 FROM review_unit_holds h WHERE h.review_unit_id=u.review_unit_id)) ORDER BY u.review_unit_id")?;
-	let mut rows = statement.query([generation.generation_id])?;
-	while let Some(row) = rows.next()? {
-		let unit: i64 = row.get(0)?;
-		let held: bool = row.get(1)?;
-		let mut conclusive = false;
-		let mut follows = held;
-		let mut results=tx.prepare("SELECT review_unit_result_id,produced_by_job_id FROM review_unit_results
-			WHERE review_unit_id=?1 AND invalidated=0 AND commit_sha=?2 AND profile_version=?3
-			AND corroborates_review_unit_result_id IS NULL AND corroborates_inventory_exclusion_id IS NULL ORDER BY review_unit_result_id DESC")?;
-		let mut evidence_rows =
-			results.query(params![unit, generation.commit_sha, generation.profile_version])?;
-		while let Some(row) = evidence_rows.next()? {
-			let id: i64 = row.get(0)?;
-			let producer: Option<i64> = row.get(1)?;
-			let StoredEvidence::Recorded(payload) = evidence(tx, id)? else { continue };
-			if let Some(producer) = producer
-				&& owned_result(tx, generation.generation_id, producer, &payload)?
-			{
-				inventory::verify_refs(tx, generation.generation_id, &payload.inspected_refs)?;
-				if payload.disposition == UnitResultDisposition::NeedsFollowUp {
-					follows = true;
-				} else {
-					conclusive = true;
-				}
-			}
-		}
-		if held || !conclusive {
-			summary.missing_results += 1;
-			if follows {
-				summary.needs_follow_up += 1;
-			}
-		}
-	}
-	if summary.missing_results == 0
-		&& summary.unresolved_inventory == 0
-		&& summary.corroboration_satisfied
-	{
+	if rollup.complete() && summary.corroboration_satisfied {
 		summary.coverage = SurveyCoverage::Complete;
 	}
 	Ok(summary)

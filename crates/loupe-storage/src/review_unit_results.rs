@@ -108,28 +108,53 @@ pub fn insert_evidence(tx: &Transaction<'_>, new: &NewResultEvidence<'_>, now: i
 	Ok(tx.last_insert_rowid())
 }
 const EVIDENCE_COLUMNS:&str="review_unit_result_id,review_unit_id,produced_by_job_id,commit_sha,profile_version,result_payload,result_digest,disposition,inspected_refs,counterevidence,proof_gaps,corroborates_review_unit_result_id,corroborates_inventory_exclusion_id,invalidated,invalidated_reason,created_at";
-fn evidence_row(row: &Row<'_>) -> Result<EvidenceResult> {
-	let raw: String = row.get(5)?;
-	let digest: Vec<u8> = row.get(6)?;
+/// One decoder for typed reads and SQLite coverage validation. It is pure:
+/// relational authority and all database access remain with its callers.
+pub(crate) fn decode_evidence(
+	raw: &str, digest: &[u8], unit_id: i64, disposition: &str, inspected_refs: &str,
+	legacy_projections_empty: bool,
+) -> Result<StoredEvidence<UnitResultPayloadV1>> {
+	if raw.len() > UnitResultPayloadV1::MAX_BYTES
+		|| inspected_refs.len() > UnitResultPayloadV1::MAX_BYTES
+	{
+		return Err(loupe_core::review_payload::Error::Bytes {
+			field: "unit_result",
+			max_bytes: UnitResultPayloadV1::MAX_BYTES,
+		}
+		.into());
+	}
 	let payload = crate::review::checkpoint_evidence(
-		&raw,
-		&digest,
+		raw,
+		digest,
 		UnitResultPayloadV1::from_json,
 		UnitResultPayloadV1::canonical_bytes,
 	)?;
-	let unit_id: i64 = row.get(1)?;
 	if let StoredEvidence::Recorded(value) = &payload
 		&& (value.review_unit_id != unit_id
-			|| row.get::<_, String>(7)? != value.disposition.as_str()
-			|| row.get::<_, String>(8)?
-				!= InspectedRefs::new(value.inspected_refs.clone())?.expose()
-			|| row.get::<_, Option<String>>(9)?.is_some()
-			|| row.get::<_, Option<String>>(10)?.is_some()
-			|| row.get::<_, Option<i64>>(11)?.is_some()
-			|| row.get::<_, Option<i64>>(12)?.is_some())
+			|| disposition != value.disposition.as_str()
+			|| inspected_refs != InspectedRefs::new(value.inspected_refs.clone())?.expose()
+			|| !legacy_projections_empty)
 	{
 		return Err(Error::Conflict(Conflict::CheckpointEvidence));
 	}
+	Ok(payload)
+}
+fn evidence_row(row: &Row<'_>) -> Result<EvidenceResult> {
+	let raw: String = row.get(5)?;
+	let digest: Vec<u8> = row.get(6)?;
+	let unit_id: i64 = row.get(1)?;
+	let empty = matches!(row.get_ref(9)?, rusqlite::types::ValueRef::Null)
+		&& matches!(row.get_ref(10)?, rusqlite::types::ValueRef::Null)
+		&& matches!(row.get_ref(11)?, rusqlite::types::ValueRef::Null)
+		&& matches!(row.get_ref(12)?, rusqlite::types::ValueRef::Null);
+	let payload = decode_evidence(
+		&raw,
+		&digest,
+		unit_id,
+		&row.get::<_, String>(7)?,
+		&row.get::<_, String>(8)?,
+		empty,
+	)?;
 	Ok(EvidenceResult {
 		result_id: row.get(0)?,
 		unit_id,

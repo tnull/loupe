@@ -289,7 +289,19 @@ fn ordinary_uses_highest_band_oldest_member_and_excludes_ineligible_units() {
 	mutate(&db,"UPDATE jobs SET state='leased' WHERE id=101; INSERT INTO job_assigned_review_units(job_id,review_unit_id,position,assignment_epoch) VALUES(101,3,0,0)");
 	let policy = ClaimPolicy { active_surveys_per_repo: 2, ..ClaimPolicy::default() };
 	assert_eq!(select(&db, ALL, &policy, 1)[0].rank_band, Band::Normal);
-	mutate(&db,"INSERT INTO review_unit_results(review_unit_id,commit_sha,profile_version,disposition,inspected_refs,result_payload,result_digest,created_at) SELECT 4,generation_commit_sha,1,'no_lead_found','[]','{}',zeroblob(32),0 FROM review_generations WHERE generation_id=11");
+	// This is a covered negative control, not historical metadata pretending to
+	// be current evidence. Keep the final exclusion assertion unchanged.
+	db.with_conn(|conn|transaction::immediate(conn,|tx| {
+		let profile=loupe_core::review_payload::GeneratedProfile::new("{}")?;
+		tx.execute("UPDATE review_generations SET generated_profile_digest=?1 WHERE generation_id=11",[profile.digest().as_slice()])?;
+		tx.execute("UPDATE jobs SET head_sha=?1,workflow_contract_version=1 WHERE id=101",[SHA])?;
+		tx.execute("UPDATE review_units SET created_by_job_id=101 WHERE review_unit_id=4",[])?;
+		tx.execute("UPDATE generation_manifests SET expected_entry_count=1,received_entry_count=1 WHERE generation_id=11",[])?;
+		tx.execute("INSERT INTO generation_inventory(generation_id,path,source_path,raw_path,blob_sha,entry_kind,git_mode,manifest_position,disposition,created_at) VALUES(11,'src.rs','src.rs',?1,?2,'tracked',33188,0,'context',0)",params![b"src.rs".as_slice(),SHA])?;
+		let payload=loupe_core::review_payload::UnitResultPayloadV1::from_json(&serde_json::json!({"format":"loupe.unit_result","version":1,"review_unit_id":4,"assignment_epoch":0,"disposition":"no_lead_found","inspected_refs":[{"path":"src.rs"}],"created_lead_ids":[],"counterevidence":"Guard traced","proof_gaps":"None"}).to_string())?;
+		crate::review_unit_results::insert_evidence(tx,&crate::review_unit_results::NewResultEvidence{generation_id:11,produced_by_job:101,commit_sha:SHA,profile_version:1,payload:&payload},0)?;
+		Ok(())
+	})).unwrap();
 	assert!(select(&db, ALL, &policy, 1).is_empty());
 }
 

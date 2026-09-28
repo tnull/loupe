@@ -199,6 +199,41 @@ async fn modern_conclusive_evidence_and_real_corroboration_are_both_required() {
 }
 
 #[tokio::test]
+async fn unrelated_damaged_result_is_incomplete_not_a_terminal_mutation_failure() {
+	for damage in ["none", "digest", "malformed", "refs"] {
+		let (f, generation) = ready().await;
+		let (unit, result) = unit(&f, generation, "other-producer", Some("no_lead_found"));
+		f.state.db.with_conn(|conn| {
+			conn.execute("INSERT INTO jobs(repo_id,kind,state,campaign_id,generation_id,head_sha,workflow_contract_version,enqueued_at) VALUES(1,'survey','succeeded',?1,?2,?3,1,0)",params![f.campaign,generation,SHA])?;
+			let other=conn.last_insert_rowid();
+			conn.execute("UPDATE review_unit_results SET produced_by_job_id=?2 WHERE review_unit_result_id=?1",params![result,other])?;
+			conn.execute("UPDATE review_units SET created_by_job_id=?2 WHERE review_unit_id=?1",params![unit,other])?;
+			conn.execute("UPDATE generation_inventory SET disposition='context'",[])?;
+			conn.execute("UPDATE review_generations SET corroboration_state='satisfied'",[])?;
+			match damage {
+				"digest"=>{conn.execute("UPDATE review_unit_results SET result_digest=zeroblob(32)",[])?;},
+				"malformed"=>{conn.execute("UPDATE review_unit_results SET result_payload='{'",[])?;},
+				"refs"=>{conn.execute("UPDATE generation_inventory SET source_path='different.rs',raw_path=CAST('different.rs' AS BLOB) WHERE source_path='z.rs'",[])?;},
+				_=>{},
+			}
+			Ok(())
+		}).unwrap();
+		let (status, reply) = request(&f, f.job, "finalize-survey", payload("partial")).await;
+		assert_eq!(status,StatusCode::OK,"unrelated {damage} evidence must be non-covering, not prevent terminal progress: {reply}");
+		assert_eq!(
+			reply["receipt"]["summary"]["coverage"],
+			if damage == "none" { "complete" } else { "partial" }
+		);
+		assert_eq!(reply["receipt"]["summary"]["missing_results"], i64::from(damage != "none"));
+		assert_eq!(
+			scalar(&f, "SELECT COUNT(*) FROM review_unit_results"),
+			1,
+			"damaged derived evidence is not silently deleted"
+		);
+	}
+}
+
+#[tokio::test]
 async fn missing_preparation_and_wrong_authority_never_seal() {
 	for damage in [
 		"unprepared",
