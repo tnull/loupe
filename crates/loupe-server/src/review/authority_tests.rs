@@ -64,6 +64,49 @@ fn allowed(f: &Fixture, phase: JobKind, access: Access) -> bool {
 }
 
 #[test]
+fn profile_version_bounds_revoke_domain_not_lease_control() {
+	let mut domain = Vec::new();
+	for version in ["1", "4294967295", "4294967296", "1.5"] {
+		let f = fixture();
+		assert!(allowed(&f, JobKind::Survey, Access::Domain));
+		mutate(
+			&f,
+			&format!(
+				"UPDATE review_generations SET profile_version={version} WHERE generation_id=11"
+			),
+		);
+		domain.push(allowed(&f, JobKind::Survey, Access::Domain));
+		assert!(allowed(&f, JobKind::Survey, Access::LeaseControl), "control: {version}");
+		finish(&f);
+		f.db.with_conn(|conn| {
+			transaction::immediate(conn, |tx| {
+				assert!(
+					matches!(
+						replay_terminal(
+							tx,
+							&f.worker,
+							&f.headers,
+							101,
+							JobKind::Survey,
+							&terminal_payload()
+						)?,
+						terminal_receipt::Replayed::Receipt(_)
+					),
+					"receipt: {version}"
+				);
+				Ok(())
+			})
+		})
+		.unwrap();
+	}
+	assert_eq!(
+		domain,
+		[true, true, false, false],
+		"fresh domain authority requires an integer profile version in the lease range"
+	);
+}
+
+#[test]
 fn identity_and_transaction_time_revocation_are_uniformly_denied() {
 	for sql in [
 		"UPDATE workers SET revoked_at=1 WHERE id=1",

@@ -151,7 +151,8 @@ impl Lease<'_, '_> {
 			.query_row(
 				"SELECT g.generated_profile,g.generated_profile_digest FROM review_generations g
 			 JOIN generation_manifests m ON m.generation_id=g.generation_id
-			 WHERE g.generation_id=?1 AND g.profile_version>0 AND m.sealed_at IS NOT NULL
+			 WHERE g.generation_id=?1 AND typeof(g.profile_version)='integer'
+			 AND g.profile_version BETWEEN 1 AND 4294967295 AND m.sealed_at IS NOT NULL
 			 AND m.received_entry_count=m.expected_entry_count",
 				[generation.id],
 				|row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
