@@ -1,66 +1,63 @@
-//! Full evidence enters once; replies contain only a constant-size sealed
-//! summary, including the server's durable continuation decision.
-use loupe_core::review_payload::{DrilldownTerminalV1, Version1};
+//! Pre-proof verification accepts independent typed evidence and returns only
+//! the bounded receipt sealed before any external report delivery.
+use loupe_core::review_payload::{VerificationTerminalV1, Version1};
+use loupe_core::FindingState;
 use serde::{Deserialize, Serialize};
 
 use crate::review_api::ReviewProtocol;
 use crate::review_lease::{ReviewCommit, ReviewDigest, ReviewId};
+use crate::review_terminal::ContinuationSummary;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FinalizeDrilldownRequest {
+pub struct FinalizeVerificationRequest {
 	pub protocol_version: ReviewProtocol,
-	pub payload: DrilldownTerminalV1,
+	pub payload: VerificationTerminalV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DrilldownDisposition {
-	Promoted,
+pub enum VerificationVerdict {
+	Verified,
 	Rejected,
-	Duplicate,
-	Hardening,
-	Deferred,
+	Inconclusive,
 }
-impl DrilldownDisposition {
+impl VerificationVerdict {
 	pub fn as_str(self) -> &'static str {
 		match self {
-			Self::Promoted => "promoted",
+			Self::Verified => "verified",
 			Self::Rejected => "rejected",
-			Self::Duplicate => "duplicate",
-			Self::Hardening => "hardening",
-			Self::Deferred => "deferred",
+			Self::Inconclusive => "inconclusive",
 		}
 	}
 }
 
-pub use crate::review_terminal::{ContinuationBlockReason, ContinuationSummary};
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DrilldownSummary {
+pub struct VerificationSummary {
 	pub version: Version1,
-	pub lead_id: ReviewId,
-	pub disposition: DrilldownDisposition,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub promoted_finding_id: Option<ReviewId>,
+	pub finding_id: ReviewId,
+	pub verification_id: ReviewId,
+	pub verdict: VerificationVerdict,
+	/// State at finalization, not a mutable delivery/approval status query.
+	pub finding_state: FindingState,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub continuation: Option<ContinuationSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DrilldownReceipt {
+pub struct VerificationReceipt {
 	pub receipt_id: ReviewId,
 	pub job_id: ReviewId,
 	pub commit_sha: ReviewCommit,
 	pub result_digest: ReviewDigest,
-	pub summary: DrilldownSummary,
+	pub summary: VerificationSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DrilldownTerminalResponse {
+pub struct VerificationTerminalResponse {
 	pub protocol_version: ReviewProtocol,
-	pub receipt: DrilldownReceipt,
+	pub receipt: VerificationReceipt,
 }

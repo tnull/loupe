@@ -1,6 +1,8 @@
 //! Strict terminal requests and constant-size sealed receipts. Full accepted
 //! evidence is retained server-side, never echoed into this response envelope.
-use loupe_core::review_payload::{SurveyTerminalReason, SurveyTerminalV1, Version1};
+use loupe_core::review_payload::{
+	ContinuationClass, SurveyTerminalReason, SurveyTerminalV1, Version1,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::review_api::ReviewProtocol;
@@ -49,4 +51,29 @@ pub struct SurveyReceipt {
 pub struct SurveyTerminalResponse {
 	pub protocol_version: ReviewProtocol,
 	pub receipt: SurveyReceipt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationBlockReason {
+	AwaitingProofInfrastructure,
+	ExternalDependency,
+	RequiresSuccessor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContinuationSummary {
+	Pending {
+		class: ContinuationClass,
+		revision: u64,
+		logical_sequence: u64,
+		not_before: i64,
+	},
+	Blocked {
+		class: ContinuationClass,
+		revision: u64,
+		logical_sequence: u64,
+		reason: ContinuationBlockReason,
+	},
 }

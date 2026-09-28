@@ -12,17 +12,15 @@ use loupe_core::text::{BoundedJson, BoundedText, SourceRef};
 use loupe_core::JobKind;
 use loupe_proto::review_api::ReviewProtocol;
 use loupe_proto::review_drilldown::{
-	ContinuationBlockReason, ContinuationSummary, DrilldownDisposition, DrilldownReceipt,
-	DrilldownSummary, DrilldownTerminalResponse, FinalizeDrilldownRequest,
+	DrilldownDisposition, DrilldownReceipt, DrilldownSummary, DrilldownTerminalResponse,
+	FinalizeDrilldownRequest,
 };
-use loupe_proto::review_lease::{FrozenReviewProfile, ReviewCommit};
-use loupe_storage::review_intents::{
-	BlockReason, Intent, IntentKind, State as IntentState, Subject,
-};
+use loupe_proto::review_lease::ReviewCommit;
+use loupe_storage::review_intents::Subject;
 use loupe_storage::terminal_payloads::TerminalPayload;
 use loupe_storage::{
-	duplicate_candidates, inventory, jobs, leads, review_findings, review_intents,
-	terminal_receipt, Conflict, StoredEvidence,
+	duplicate_candidates, inventory, leads, review_findings, review_intents, terminal_receipt,
+	Conflict, StoredEvidence,
 };
 use rusqlite::{params, Transaction};
 
@@ -66,37 +64,6 @@ fn original_digest(
 	payload.digest().map_err(|_| incompatible())
 }
 
-/// The retained accepted priority and exact admitted revision are the only
-/// source of downstream admission rank. A missing intent cannot be fabricated.
-fn admitted_intent(
-	tx: &Transaction<'_>, scope: &Authorized<'_, '_>, lead: i64, sha: &str,
-	profile: &FrozenReviewProfile,
-) -> Result<Intent> {
-	let intent = review_intents::get_subject(tx, Subject::Lead(lead))?.ok_or_else(incompatible)?;
-	let job = jobs::get(tx, scope.job().id)?.ok_or_else(ApiError::denied)?;
-	if intent.state != IntentState::Admitted
-		|| intent.admitted_job_id != Some(job.id)
-		|| intent.repo_id != job.repo_id
-		|| intent.generation_id != job.generation_id
-		|| Some(intent.admission_campaign_id) != job.campaign_id
-		|| intent.source_commit_sha != sha
-		|| intent.profile_version != i64::from(profile.profile_version.get())
-		|| intent.profile_digest != profile.profile.digest()
-		|| intent.revision <= 0
-		|| intent.logical_sequence < 0
-		|| intent.priority.score > 550
-		|| job.parent_job_id != Some(intent.originating_job_id)
-		|| job.scheduling_band != Some(intent.priority.band)
-		|| job.continuation_of_job_id
-			!= match intent.kind {
-				IntentKind::InitialHandoff => None,
-				IntentKind::LogicalContinuation => Some(intent.originating_job_id),
-			} {
-		return Err(incompatible());
-	}
-	Ok(intent)
-}
-
 fn validate_sources(
 	tx: &Transaction<'_>, generation: i64, lead: &leads::Metadata, sha: &str,
 	payload: &DrilldownTerminalV1,
@@ -130,42 +97,6 @@ fn validate_sources(
 		inventory::verify_refs(tx, generation, &revalidation.current_source_refs)?;
 	}
 	Ok(())
-}
-
-fn continuation(intent: &Intent) -> Result<ContinuationSummary> {
-	let class = intent.continuation_class.ok_or_else(incompatible)?;
-	let revision = intent.revision.try_into().map_err(|_| incompatible())?;
-	let logical_sequence = intent.logical_sequence.try_into().map_err(|_| incompatible())?;
-	match intent.state {
-		IntentState::Pending
-			if class == ContinuationClass::SourceAnalysisRemaining
-				&& intent.block_reason.is_none() =>
-		{
-			Ok(ContinuationSummary::Pending {
-				class,
-				revision,
-				logical_sequence,
-				not_before: intent.not_before.ok_or_else(incompatible)?,
-			})
-		},
-		IntentState::Blocked if intent.not_before.is_none() => {
-			let reason = match (class, intent.block_reason) {
-				(
-					ContinuationClass::AwaitingProofInfrastructure,
-					Some(BlockReason::AwaitingProofInfrastructure),
-				) => ContinuationBlockReason::AwaitingProofInfrastructure,
-				(ContinuationClass::ExternalDependency, Some(BlockReason::ExternalDependency)) => {
-					ContinuationBlockReason::ExternalDependency
-				},
-				(ContinuationClass::RequiresSuccessor, Some(BlockReason::RequiresSuccessor)) => {
-					ContinuationBlockReason::RequiresSuccessor
-				},
-				_ => return Err(incompatible()),
-			};
-			Ok(ContinuationSummary::Blocked { class, revision, logical_sequence, reason })
-		},
-		_ => Err(incompatible()),
-	}
 }
 
 fn reply(receipt: &terminal_receipt::Receipt) -> Result<DrilldownTerminalResponse> {
@@ -234,7 +165,13 @@ pub async fn finalize(
 		let original = original_digest(tx, &scope, &lead)?;
 		let audit = terminal::audit(tx, &scope)?;
 		let profile = envelope::profile(tx, generation)?.ok_or_else(incompatible)?;
-		let intent = admitted_intent(tx, &scope, lead_id, &audit.pinned_commit_sha, &profile)?;
+		let intent = terminal::admitted_subject(
+			tx,
+			&scope,
+			Subject::Lead(lead_id),
+			&audit.pinned_commit_sha,
+			&profile,
+		)?;
 		let TerminalPayload::Drilldown(terminal_payload) = &payload else { unreachable!() };
 		validate_sources(tx, generation, &lead, &audit.pinned_commit_sha, terminal_payload)?;
 		let mut summary = DrilldownSummary {
@@ -315,13 +252,9 @@ pub async fn finalize(
 		}
 		terminal::succeed(tx, job, now)?;
 		if let DrilldownTerminalV1::Defer { continuation: class, .. } = terminal_payload {
-			summary.continuation = Some(continuation(&review_intents::continue_subject(
-				tx,
-				Subject::Lead(lead_id),
-				job,
-				*class,
-				now,
-			)?)?);
+			summary.continuation = Some(terminal::continuation(
+				&review_intents::continue_subject(tx, Subject::Lead(lead_id), job, *class, now)?,
+			)?);
 		} else {
 			review_intents::finish_subject_intent(tx, Subject::Lead(lead_id), job, now)?;
 		}

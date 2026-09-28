@@ -1,8 +1,14 @@
 //! Caller-transactional terminal mechanics. Domain consumers validate evidence
 //! and pending work; this module seals durable audit copies and replay identity.
 use axum::http::HeaderMap;
+use loupe_core::review_payload::ContinuationClass;
 use loupe_core::text::policy::Payload;
 use loupe_core::text::BoundedJson;
+use loupe_proto::review_lease::FrozenReviewProfile;
+use loupe_proto::review_terminal::{ContinuationBlockReason, ContinuationSummary};
+use loupe_storage::review_intents::{
+	self, BlockReason, Intent, IntentKind, State as IntentState, Subject,
+};
 use loupe_storage::terminal_payloads::TerminalPayload;
 use loupe_storage::{admission, host_preparation, jobs, terminal_payloads, terminal_receipt};
 use rusqlite::{params, Transaction};
@@ -81,4 +87,84 @@ pub fn seal(
 	terminal_receipt::insert(tx, receipt, now)?;
 	terminal_payloads::insert(tx, receipt.job_id, payload)?;
 	terminal_receipt::get(tx, receipt.job_id)?.ok_or_else(ApiError::denied)
+}
+
+fn incompatible() -> ApiError {
+	ApiError::conflict("incompatible_review_state")
+}
+
+/// The retained accepted priority and exact admitted revision are the only
+/// source of downstream admission rank. A missing intent cannot be fabricated.
+pub fn admitted_subject(
+	tx: &Transaction<'_>, scope: &Authorized<'_, '_>, subject: Subject, sha: &str,
+	profile: &FrozenReviewProfile,
+) -> Result<Intent> {
+	let intent = review_intents::get_subject(tx, subject)?.ok_or_else(incompatible)?;
+	let job = jobs::get(tx, scope.job().id)?.ok_or_else(ApiError::denied)?;
+	let owns_subject = match subject {
+		Subject::Lead(id) => {
+			job.kind == loupe_core::JobKind::Drilldown && job.assigned_lead_id == Some(id)
+		},
+		Subject::Finding(id) => {
+			job.kind == loupe_core::JobKind::Verify && job.target_finding_id == Some(id)
+		},
+	};
+	if !owns_subject
+		|| intent.state != IntentState::Admitted
+		|| intent.admitted_job_id != Some(job.id)
+		|| intent.repo_id != job.repo_id
+		|| intent.generation_id != job.generation_id
+		|| Some(intent.admission_campaign_id) != job.campaign_id
+		|| intent.source_commit_sha != sha
+		|| intent.profile_version != i64::from(profile.profile_version.get())
+		|| intent.profile_digest != profile.profile.digest()
+		|| intent.revision <= 0
+		|| intent.logical_sequence < 0
+		|| intent.priority.score > 550
+		|| job.parent_job_id != Some(intent.originating_job_id)
+		|| job.scheduling_band != Some(intent.priority.band)
+		|| job.continuation_of_job_id
+			!= match intent.kind {
+				IntentKind::InitialHandoff => None,
+				IntentKind::LogicalContinuation => Some(intent.originating_job_id),
+			} {
+		return Err(incompatible());
+	}
+	Ok(intent)
+}
+
+pub fn continuation(intent: &Intent) -> Result<ContinuationSummary> {
+	let class = intent.continuation_class.ok_or_else(incompatible)?;
+	let revision = intent.revision.try_into().map_err(|_| incompatible())?;
+	let logical_sequence = intent.logical_sequence.try_into().map_err(|_| incompatible())?;
+	match intent.state {
+		IntentState::Pending
+			if class == ContinuationClass::SourceAnalysisRemaining
+				&& intent.block_reason.is_none() =>
+		{
+			Ok(ContinuationSummary::Pending {
+				class,
+				revision,
+				logical_sequence,
+				not_before: intent.not_before.ok_or_else(incompatible)?,
+			})
+		},
+		IntentState::Blocked if intent.not_before.is_none() => {
+			let reason = match (class, intent.block_reason) {
+				(
+					ContinuationClass::AwaitingProofInfrastructure,
+					Some(BlockReason::AwaitingProofInfrastructure),
+				) => ContinuationBlockReason::AwaitingProofInfrastructure,
+				(ContinuationClass::ExternalDependency, Some(BlockReason::ExternalDependency)) => {
+					ContinuationBlockReason::ExternalDependency
+				},
+				(ContinuationClass::RequiresSuccessor, Some(BlockReason::RequiresSuccessor)) => {
+					ContinuationBlockReason::RequiresSuccessor
+				},
+				_ => return Err(incompatible()),
+			};
+			Ok(ContinuationSummary::Blocked { class, revision, logical_sequence, reason })
+		},
+		_ => Err(incompatible()),
+	}
 }

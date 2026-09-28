@@ -124,6 +124,7 @@ pub fn is_phase_route(path: &str) -> bool {
 			| "/v1/jobs/{id}/review-unit-results"
 			| "/v1/jobs/{id}/finalize-survey"
 			| "/v1/jobs/{id}/finalize-drilldown"
+			| "/v1/jobs/{id}/finalize-verification"
 			| "/v1/jobs/{id}/limits"
 			| "/v1/jobs/{id}/lead-candidates"
 	)

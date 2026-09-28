@@ -21,7 +21,7 @@ async fn ready() -> (Fixture, i64, i64) {
 	ready_fixture(fixture()).await
 }
 
-async fn ready_fixture(f: Fixture) -> (Fixture, i64, i64) {
+pub(super) async fn ready_fixture(f: Fixture) -> (Fixture, i64, i64) {
 	let pin = post(&f, "pin-target", json!({"protocol_version":3,"commit_sha":SHA})).await;
 	let generation = pin["generation"]["generation_id"].as_i64().unwrap();
 	let entries = vec!["a%FF", "cafe\u{301}.rs", "café.rs", "z.rs"]
@@ -158,7 +158,7 @@ async fn defer_preserves_multiline_prose_and_creates_only_a_typed_pending_intent
 	assert_eq!(scalar(&f, "SELECT general_spent FROM campaign_admission_spending"), 1);
 }
 
-fn promote() -> Value {
+pub(super) fn promote() -> Value {
 	body(json!({"version":1,"disposition":"promote","promotion":{
 		"version":1,"severity":"high","title":"Untrusted allocation control",
 		"description":"Attacker-controlled length reaches the allocator.\nCanonical details remain literal.",

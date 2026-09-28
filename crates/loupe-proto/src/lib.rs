@@ -18,6 +18,7 @@ pub mod review_lease;
 pub mod review_lifecycle;
 pub mod review_terminal;
 pub mod review_units;
+pub mod review_verification;
 mod scan;
 mod version;
 
