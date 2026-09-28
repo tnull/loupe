@@ -24,10 +24,11 @@ pub struct ApiError {
 	status: StatusCode,
 	code: &'static str,
 	detail: Option<String>,
+	current_revision: Option<i64>,
 }
 impl ApiError {
 	pub fn new(status: StatusCode, code: &'static str) -> Self {
-		Self { status, code, detail: None }
+		Self { status, code, detail: None, current_revision: None }
 	}
 	pub fn denied() -> Self {
 		Self::new(StatusCode::FORBIDDEN, "denied")
@@ -35,12 +36,20 @@ impl ApiError {
 	pub fn conflict(code: &'static str) -> Self {
 		Self::new(StatusCode::CONFLICT, code)
 	}
+	/// Only after entry scope authorization; never disclose an unscoped revision.
+	pub fn inventory_revision_conflict(current_revision: i64) -> Self {
+		Self {
+			current_revision: Some(current_revision),
+			..Self::conflict("inventory_revision_conflict")
+		}
+	}
 	pub fn invalid(detail: impl std::fmt::Display) -> Self {
 		Self {
 			status: StatusCode::BAD_REQUEST,
 			code: "invalid_request",
 			// JSON escaping can expand every scalar: this keeps errors below 4 KiB.
 			detail: Some(detail.to_string().chars().take(256).collect()),
+			current_revision: None,
 		}
 	}
 }
@@ -71,11 +80,15 @@ impl From<rusqlite::Error> for ApiError {
 }
 impl IntoResponse for ApiError {
 	fn into_response(self) -> Response {
+		let mut error = serde_json::json!({"code":self.code,"detail":self.detail});
+		if let Some(revision) = self.current_revision {
+			error["current_revision"] = serde_json::json!(revision);
+		}
 		let mut response = (
 			self.status,
 			axum::Json(serde_json::json!({
 				"protocol_version": PROTOCOL_VERSION,
-				"error": {"code": self.code, "detail": self.detail}
+				"error": error
 			})),
 		)
 			.into_response();
@@ -104,6 +117,7 @@ pub fn is_phase_route(path: &str) -> bool {
 			| "/v1/jobs/{id}/inventory-batches"
 			| "/v1/jobs/{id}/seal-inventory"
 			| "/v1/jobs/{id}/publish-profile"
+			| "/v1/jobs/{id}/inventory-dispositions"
 			| "/v1/jobs/{id}/limits"
 			| "/v1/jobs/{id}/lead-candidates"
 	)

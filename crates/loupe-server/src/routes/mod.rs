@@ -4,5 +4,6 @@ pub mod jobs;
 pub mod repos;
 pub mod review_context;
 pub mod review_host;
+pub mod review_inventory;
 pub mod whoami;
 pub mod workers;

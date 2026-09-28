@@ -130,6 +130,13 @@ impl Authorized<'_, '_> {
 			&& self.job().kind == JobKind::Survey
 			&& self.lease.survey_unit(unit, epoch, self.bootstrap)?)
 	}
+	/// Mapping an owned unit is a reference, not a new assessment. Keep this
+	/// separate from fresh result authority so mapping may follow its result.
+	pub fn survey_unit_reference(&self, unit: i64, epoch: i64) -> Result<bool> {
+		Ok(self.access == Access::Domain
+			&& self.job().kind == JobKind::Survey
+			&& self.lease.survey_unit_reference(unit, epoch, self.bootstrap)?)
+	}
 	pub fn assigned_lead(&self, lead: i64) -> Result<bool> {
 		Ok(self.access == Access::Domain
 			&& self.job().kind == JobKind::Drilldown

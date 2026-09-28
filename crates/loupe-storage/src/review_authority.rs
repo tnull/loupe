@@ -162,6 +162,24 @@ impl Lease<'_, '_> {
 		Ok(profile.expose() == raw && digest == profile.digest())
 	}
 
+	/// Reference authority for disposition mappings, not permission to submit
+	/// another result. Completed results and follow-up holds do not erase the
+	/// current job's exact scope/epoch; a later owner still revokes it by epoch.
+	pub fn survey_unit_reference(&self, id: i64, epoch: i64, bootstrap: bool) -> Result<bool> {
+		let membership = if bootstrap {
+			"u.created_by_job_id=?3"
+		} else {
+			"EXISTS(SELECT 1 FROM job_assigned_review_units a WHERE a.job_id=?3 AND a.review_unit_id=u.review_unit_id AND a.assignment_epoch=?4)"
+		};
+		Ok(self.tx.query_row(
+			&format!("SELECT EXISTS(SELECT 1 FROM review_units u WHERE u.review_unit_id=?1
+			 AND u.generation_id=?2 AND {membership} AND u.assignment_epoch=?4
+			 AND NOT EXISTS(SELECT 1 FROM job_assigned_review_units a JOIN jobs j ON j.id=a.job_id
+			 WHERE a.review_unit_id=u.review_unit_id AND a.job_id<>?3 AND j.state IN ('queued','leased')))"),
+			params![id,self.job.generation_id,self.job.id,epoch], |row|row.get(0),
+		)?)
+	}
+
 	/// Fresh-only check. Run after checkpoint replay lookup, not before it.
 	pub fn survey_unit(&self, id: i64, epoch: i64, bootstrap: bool) -> Result<bool> {
 		let membership = if bootstrap {

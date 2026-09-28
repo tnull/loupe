@@ -24,6 +24,9 @@ const NEXT_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 #[path = "review_context/mod.rs"]
 mod context;
 
+#[path = "review_inventory/mod.rs"]
+mod inventory_dispositions;
+
 struct Fixture {
 	state: AppState,
 	peer: PeerCert,
@@ -40,6 +43,10 @@ fn now() -> i64 {
 
 fn fixture() -> Fixture {
 	let db = Arc::new(Db::open_in_memory(&loupe_storage::secrets::MasterKey::for_tests()).unwrap());
+	fixture_with_db(db)
+}
+
+fn fixture_with_db(db: Arc<Db>) -> Fixture {
 	let ca = Ca::new("host-tests").unwrap();
 	let cert = |name| {
 		let bundle = ca.mint_client(name).unwrap();

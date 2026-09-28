@@ -18,6 +18,7 @@ pub mod generations;
 pub mod host_preparation;
 pub mod identity;
 pub mod inventory;
+pub mod inventory_disposition;
 pub mod jobs;
 pub mod lead_observations;
 pub mod leads;
